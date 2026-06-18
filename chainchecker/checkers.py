@@ -660,11 +660,49 @@ def _build_file_reports(report: CheckReport, outline: ParsedOutline) -> None:
             report.file_reports[fp] = FileReport(file_path=fp, issues=file_issues)
 
 
-def _fill_related_endings(report: CheckReport, traversal: TraversalResult) -> None:
+def _find_endings_via_ancestors(outline: ParsedOutline, node_id: str) -> List[str]:
+    """沿父链向上回溯，收集兄弟子树中的结局名称（用于不可达路径上的节点）"""
+    endings: Set[str] = set()
+    visited: Set[str] = set()
+    nid = node_id
+    while nid:
+        if nid in visited:
+            break
+        visited.add(nid)
+        node = outline.get_node(nid)
+        if node is None:
+            break
+        parent = outline.get_node(node.parent) if node.parent else None
+        if parent is None:
+            break
+        for sibling_id in parent.children:
+            if sibling_id == nid:
+                continue
+            _collect_endings_in_subtree(outline, sibling_id, endings, set())
+        nid = node.parent
+    return sorted(endings)
+
+
+def _collect_endings_in_subtree(outline: ParsedOutline, node_id: str, endings: Set[str], visited: Set[str]) -> None:
+    """递归收集子树中的所有结局名称"""
+    if node_id in visited:
+        return
+    visited.add(node_id)
+    node = outline.get_node(node_id)
+    if node is None:
+        return
+    if node.endings:
+        endings.update(node.endings)
+    for child_id in node.children:
+        _collect_endings_in_subtree(outline, child_id, endings, visited)
+
+
+def _fill_related_endings(report: CheckReport, traversal: TraversalResult, outline: ParsedOutline) -> None:
     """
     根据遍历结果填充每个问题的 related_endings。
     - 已有 related_endings 的（如不可达结局、弱铺垫）跳过
-    - 有 node_ids 的，通过遍历所有经过这些节点的路径来收集结局
+    - 有 node_ids 的，先通过可达路径收集结局
+    - 可达路径找不到的，沿父链回溯兄弟子树推断结局归属
     """
     for issue in report.issues:
         if issue.related_endings:
@@ -678,6 +716,10 @@ def _fill_related_endings(report: CheckReport, traversal: TraversalResult) -> No
             path_nodes = set(path.node_ids)
             if node_set & path_nodes:
                 endings.update(path.reached_endings)
+
+        if not endings:
+            for nid in issue.node_ids:
+                endings.update(_find_endings_via_ancestors(outline, nid))
 
         issue.related_endings = sorted(endings)
 
@@ -732,7 +774,7 @@ def run_all_checks(
     report.issues = issues
 
     # 填充关联结局
-    _fill_related_endings(report, traversal)
+    _fill_related_endings(report, traversal, outline)
 
     # 按文件汇总
     _build_file_reports(report, outline)
@@ -749,15 +791,62 @@ def issue_unique_key(issue: Issue) -> str:
     """生成问题的唯一标识键（用于基线对比）"""
     lines_key = ",".join(str(l) for l in issue.line_numbers)
     files_key = ",".join(Path(f).name for f in issue.source_files) if issue.source_files else ""
-    # 用类型+消息前80字+文件+行号作为唯一键
     return f"{issue.issue_type}|{issue.message[:80]}|{files_key}|{lines_key}"
 
 
-def save_baseline(report: CheckReport, output_path: str = BASELINE_FILENAME) -> None:
-    """将当前报告的问题保存为基线文件"""
+@dataclass
+class BaselineEntry:
+    """单条基线记录"""
+    name: str
+    tag: str = ""
+    created_at: str = ""
+    issue_keys: Set[str] = field(default_factory=set)
+    issue_count: int = 0
+    issues: List[dict] = field(default_factory=list)
+
+
+def _load_baseline_file(path: str) -> Optional[dict]:
+    """加载基线文件原始数据"""
     import json
-    baseline = {
-        "version": 1,
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def _save_baseline_file(path: str, data: dict) -> None:
+    """保存基线文件"""
+    import json
+    Path(path).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+
+def save_baseline(
+    report: CheckReport,
+    output_path: str = BASELINE_FILENAME,
+    name: str = "default",
+    tag: str = "",
+) -> None:
+    """将当前报告的问题保存为基线（支持多条基线共存）
+
+    Args:
+        report: 检查报告
+        output_path: 基线文件路径
+        name: 基线名称（用于区分不同基线，如"弱铺垫清理"、"井结局线"）
+        tag: 分类标签（如 issue_type 或 ending 线名）
+    """
+    import json
+    from datetime import datetime
+
+    new_entry = {
+        "name": name,
+        "tag": tag,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "issue_count": len(report.issues),
         "issues": [
             {
@@ -770,40 +859,129 @@ def save_baseline(report: CheckReport, output_path: str = BASELINE_FILENAME) -> 
                 "related_endings": issue.related_endings,
             }
             for issue in report.issues
-        ]
+        ],
     }
-    Path(output_path).write_text(
-        json.dumps(baseline, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+
+    data = _load_baseline_file(output_path)
+    if data is None:
+        data = {"version": 2, "baselines": []}
+
+    if data.get("version", 1) < 2:
+        old_issues = data.get("issues", [])
+        old_keys = {item["key"] for item in old_issues}
+        data = {
+            "version": 2,
+            "baselines": [
+                {
+                    "name": "default",
+                    "tag": "",
+                    "created_at": "",
+                    "issue_count": len(old_issues),
+                    "issues": old_issues,
+                }
+            ],
+        }
+
+    existing_idx = None
+    for i, bl in enumerate(data["baselines"]):
+        if bl["name"] == name:
+            existing_idx = i
+            break
+
+    if existing_idx is not None:
+        data["baselines"][existing_idx] = new_entry
+    else:
+        data["baselines"].append(new_entry)
+
+    _save_baseline_file(output_path, data)
 
 
-def load_baseline(baseline_path: str = BASELINE_FILENAME) -> Optional[Set[str]]:
-    """加载基线文件，返回问题键的集合。文件不存在返回 None。"""
-    import json
-    path = Path(baseline_path)
-    if not path.exists():
+def list_baselines(baseline_path: str = BASELINE_FILENAME) -> List[BaselineEntry]:
+    """列出基线文件中的所有基线"""
+    data = _load_baseline_file(baseline_path)
+    if data is None:
+        return []
+
+    baselines_raw = data.get("baselines", [])
+    if not baselines_raw and data.get("issues"):
+        baselines_raw = [{
+            "name": "default",
+            "tag": "",
+            "created_at": "",
+            "issue_count": len(data.get("issues", [])),
+            "issues": data.get("issues", []),
+        }]
+
+    result = []
+    for bl in baselines_raw:
+        keys = {item["key"] for item in bl.get("issues", [])}
+        result.append(BaselineEntry(
+            name=bl.get("name", "default"),
+            tag=bl.get("tag", ""),
+            created_at=bl.get("created_at", ""),
+            issue_keys=keys,
+            issue_count=bl.get("issue_count", len(keys)),
+            issues=bl.get("issues", []),
+        ))
+    return result
+
+
+def load_baseline(
+    baseline_path: str = BASELINE_FILENAME,
+    name: Optional[str] = None,
+) -> Optional[Set[str]]:
+    """加载基线文件中指定名称的基线，返回问题键的集合。
+
+    Args:
+        baseline_path: 基线文件路径
+        name: 基线名称，None 则返回第一条（兼容旧行为）
+    """
+    baselines = list_baselines(baseline_path)
+    if not baselines:
         return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return {item["key"] for item in data.get("issues", [])}
-    except (json.JSONDecodeError, KeyError):
+
+    if name:
+        for bl in baselines:
+            if bl.name == name:
+                return bl.issue_keys
         return None
 
+    return baselines[0].issue_keys
 
-def apply_baseline(report: CheckReport, baseline_keys: Set[str]) -> Tuple[int, int]:
+
+@dataclass
+class BaselineComparison:
+    """基线对比结果"""
+    new_count: int = 0
+    baseline_count: int = 0
+    fixed_count: int = 0
+
+    @property
+    def total_current(self) -> int:
+        return self.new_count + self.baseline_count
+
+
+def apply_baseline(report: CheckReport, baseline_keys: Set[str]) -> BaselineComparison:
     """
     将基线应用到报告上，标记 is_baseline。
-    返回 (新增问题数, 基线问题数)
+    返回 BaselineComparison（新增/旧账/已修复）。
     """
+    current_keys = set()
     new_count = 0
     baseline_count = 0
     for issue in report.issues:
         key = issue_unique_key(issue)
+        current_keys.add(key)
         if key in baseline_keys:
             issue.is_baseline = True
             baseline_count += 1
         else:
             issue.is_baseline = False
             new_count += 1
-    return new_count, baseline_count
+
+    fixed_count = len(baseline_keys - current_keys)
+    return BaselineComparison(
+        new_count=new_count,
+        baseline_count=baseline_count,
+        fixed_count=fixed_count,
+    )

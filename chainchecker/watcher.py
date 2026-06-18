@@ -39,17 +39,31 @@ class WatchState:
         return (issue.issue_type, issue.severity, issue.message[:60] + "|" + lines_key + "|" + files_key)
 
 
-def _collect_target_files(path: Path, pattern: str = "*.md") -> List[Path]:
-    """收集需要监控的文件列表"""
+def _collect_target_files(path: Path, pattern: str = "*.md", config_path: Optional[str] = None) -> List[Path]:
+    """收集需要监控的文件列表（包括配置文件）"""
     if path.is_file():
-        return [path]
-    files = list(path.glob(pattern))
-    if not files:
-        files = list(path.glob("*.txt"))
-    # 也监控配置文件
-    config_path = path / DEFAULT_CONFIG_FILENAME if path.is_dir() else path.parent / DEFAULT_CONFIG_FILENAME
-    if config_path.exists():
-        files.append(config_path)
+        files = [path]
+    else:
+        files = list(path.glob(pattern))
+        if not files:
+            files = list(path.glob("*.txt"))
+
+    if path.is_dir():
+        default_config = path / DEFAULT_CONFIG_FILENAME
+        if default_config.exists():
+            files.append(default_config)
+
+    if config_path:
+        cp = Path(config_path)
+        if cp.exists() and cp not in files:
+            files.append(cp)
+    else:
+        for d in [Path.cwd()] + list(Path.cwd().parents):
+            candidate = d / DEFAULT_CONFIG_FILENAME
+            if candidate.exists() and candidate not in files:
+                files.append(candidate)
+                break
+
     return sorted(files)
 
 
@@ -238,7 +252,7 @@ def run_watch(
         print(f"   🎯 只检查结局: {', '.join(only_endings)}")
     if only_files:
         print(f"   📁 只检查文件: {', '.join(only_files)}")
-    print("   �💡 修改大纲文件后将自动重新检查")
+    print("   💡 修改大纲文件或配置文件后将自动重新检查")
     print("   💡 配置文件修改后下次重检自动生效")
     print("   💡 按 Ctrl+C 退出 watch 模式")
     print("=" * 70)
@@ -254,17 +268,17 @@ def run_watch(
         state.run_count += 1
         state.last_report = report
         state.last_issue_keys = {WatchState.issue_key(i) for i in report.issues}
-        state.snapshots = _take_snapshots(_collect_target_files(target_path, pattern))
+        state.snapshots = _take_snapshots(_collect_target_files(target_path, pattern, config_path))
         # 首次运行显示完整报告
         print(report.format(show_details=show_details))
     else:
-        state.snapshots = _take_snapshots(_collect_target_files(target_path, pattern))
+        state.snapshots = _take_snapshots(_collect_target_files(target_path, pattern, config_path))
 
     # 监控循环
     try:
         while True:
             time.sleep(poll_interval)
-            files = _collect_target_files(target_path, pattern)
+            files = _collect_target_files(target_path, pattern, config_path)
             new_snaps = _take_snapshots(files)
             changed, changed_list = _detect_changes(state.snapshots, new_snaps)
             if changed:

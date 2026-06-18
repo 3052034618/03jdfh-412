@@ -4,12 +4,12 @@ import sys
 import argparse
 import json
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from .parser import parse_outline, parse_chapter_directory
-from .checkers import run_all_checks, CheckReport, Issue, save_baseline, load_baseline, apply_baseline, BASELINE_FILENAME
+from .checkers import run_all_checks, CheckReport, Issue, save_baseline, load_baseline, apply_baseline, list_baselines, BaselineComparison, BASELINE_FILENAME
 from .config import CheckerConfig, DEFAULT_CONFIG_FILENAME
-from .exporter import export_markdown, export_html
+from .exporter import export_markdown, export_html, export_review_json
 from .watcher import run_watch
 
 
@@ -69,6 +69,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
   chaincheck chapters/ --export-html report.html 导出 HTML 报告发给同事
   chaincheck chapters/ --export-md report.md --review --group ending
                                                  导出审阅版报告，按结局分组
+  chaincheck chapters/ --export-review-json review.json
+                                                 导出审阅备注JSON，编剧填完再对齐
   chaincheck chapters/ --group ending            按结局分组显示问题
   chaincheck outline.md --no-details             简洁输出
   chaincheck --init-config                       生成默认配置文件
@@ -77,7 +79,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
   chaincheck chapters/ --draft                   草稿模式（警告降级）
   chaincheck chapters/ --only-ending "*结局A*"   只检查某条结局线
   chaincheck chapters/ --save-baseline           保存当前问题为基线
+  chaincheck chapters/ --save-baseline --baseline-name foreshadow --baseline-tag 弱铺垫
+                                                 按类型保存命名基线
   chaincheck chapters/ --compare-baseline        对比基线，只看新增问题
+  chaincheck chapters/ --compare-baseline --baseline-name foreshadow
+                                                 对比指定基线
+  chaincheck chapters/ --list-baselines          列出所有已保存的基线
 """
     )
     parser.add_argument(
@@ -159,6 +166,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="导出 HTML 格式报告到指定文件（含交互折叠，适合分享）"
     )
     parser.add_argument(
+        "--export-review-json",
+        metavar="FILE",
+        help="导出轻量审阅备注 JSON（不含技术细节，方便编剧对齐）"
+    )
+    parser.add_argument(
         "--only-ending",
         action="append",
         default=[],
@@ -193,10 +205,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="指定基线文件路径（默认: .chaincheck.baseline.json）"
     )
+    parser.add_argument(
+        "--baseline-name",
+        metavar="NAME",
+        default="default",
+        help="基线名称，用于区分多条基线（默认: default）"
+    )
+    parser.add_argument(
+        "--baseline-tag",
+        metavar="TAG",
+        default="",
+        help="基线标签，标记分类（如\"弱铺垫\"、\"井结局线\"）"
+    )
+    parser.add_argument(
+        "--list-baselines",
+        action="store_true",
+        help="列出基线文件中所有已保存的基线"
+    )
     return parser
 
 
-def _report_to_json(report: CheckReport) -> dict:
+def _report_to_json(report: CheckReport, comparison: Optional[BaselineComparison] = None) -> dict:
     """将报告转换为 JSON 格式"""
     def _issue_to_dict(issue: Issue) -> dict:
         return {
@@ -226,6 +255,7 @@ def _report_to_json(report: CheckReport) -> dict:
             "infos_count": len(report.infos),
             "new_issues_count": len(report.new_issues),
             "baseline_issues_count": len(report.baseline_issues),
+            "fixed_issues_count": comparison.fixed_count if comparison else 0,
         },
         "ending_file_map": report.ending_file_map,
         "file_reports": {
@@ -321,22 +351,42 @@ def main(argv: List[str] | None = None) -> int:
 
     # ===== 基线功能 =====
     baseline_path = args.baseline_file or str(Path.cwd() / BASELINE_FILENAME)
+    comparison: Optional[BaselineComparison] = None
+
+    if args.list_baselines:
+        baselines = list_baselines(baseline_path)
+        if not baselines:
+            print(f"未找到基线文件: {baseline_path}")
+        else:
+            print(f"📋 基线文件: {baseline_path}")
+            print(f"   共 {len(baselines)} 条基线：")
+            for bl in baselines:
+                tag_str = f" [{bl.tag}]" if bl.tag else ""
+                time_str = f" ({bl.created_at})" if bl.created_at else ""
+                print(f"   - {bl.name}{tag_str}: {bl.issue_count} 条问题{time_str}")
+        return 0
 
     if args.save_baseline:
-        save_baseline(report, baseline_path)
-        print(f"✅ 已保存基线到: {baseline_path}")
-        print(f"   共 {len(report.issues)} 条问题已记录为基线")
+        save_baseline(report, baseline_path, name=args.baseline_name, tag=args.baseline_tag)
+        tag_str = f" [{args.baseline_tag}]" if args.baseline_tag else ""
+        print(f"✅ 已保存基线「{args.baseline_name}」{tag_str}到: {baseline_path}")
+        print(f"   共 {len(report.issues)} 条问题已记录")
 
     if args.compare_baseline:
-        baseline_keys = load_baseline(baseline_path)
+        baseline_keys = load_baseline(baseline_path, name=args.baseline_name)
         if baseline_keys is None:
-            print(f"[警告] 未找到基线文件: {baseline_path}", file=sys.stderr)
+            print(f"[警告] 未找到基线「{args.baseline_name}」: {baseline_path}", file=sys.stderr)
             print("   使用 --save-baseline 先保存基线")
         else:
-            new_count, baseline_count = apply_baseline(report, baseline_keys)
-            print(f"📊 基线对比：新增 {new_count} 条，基线旧问题 {baseline_count} 条")
-            if new_count == 0:
+            comparison = apply_baseline(report, baseline_keys)
+            print(f"📊 基线对比（{args.baseline_name}）：")
+            print(f"   🔴 新增问题：{comparison.new_count} 条")
+            print(f"   🟡 旧账问题：{comparison.baseline_count} 条（不影响退出码）")
+            print(f"   🟢 已修复：{comparison.fixed_count} 条（基线中有但已消失）")
+            if comparison.new_count == 0:
                 print("✅ 没有新增问题！")
+            elif comparison.fixed_count > 0:
+                print(f"💡 已修复 {comparison.fixed_count} 条旧问题，继续加油！")
 
     # 导出
     if args.export_md:
@@ -345,6 +395,9 @@ def main(argv: List[str] | None = None) -> int:
     if args.export_html:
         export_html(report, args.export_html, args.group, outline, config, review_mode=args.review)
         print(f"✅ HTML 报告已导出到: {args.export_html}")
+    if args.export_review_json:
+        export_review_json(report, args.export_review_json)
+        print(f"✅ 审阅备注 JSON 已导出到: {args.export_review_json}")
 
     if args.quiet and not report.issues and not args.json:
         return 0
@@ -352,7 +405,7 @@ def main(argv: List[str] | None = None) -> int:
     # 输出
     if args.json:
         # 确保 UTF-8
-        json_output = json.dumps(_report_to_json(report), ensure_ascii=False, indent=2)
+        json_output = json.dumps(_report_to_json(report, comparison), ensure_ascii=False, indent=2)
         try:
             sys.stdout.reconfigure(encoding='utf-8')
         except Exception:

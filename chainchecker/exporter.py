@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from collections import defaultdict
 
-from .checkers import CheckReport, Issue, FileReport
+from .checkers import CheckReport, Issue, FileReport, issue_unique_key
 from .config import CheckerConfig
 from .parser import ParsedOutline
 
@@ -39,9 +39,16 @@ def _group_by_type(issues: List[Issue]) -> Dict[str, List[Issue]]:
 
 def _group_by_file(issues: List[Issue]) -> Dict[str, List[Issue]]:
     groups: Dict[str, List[Issue]] = defaultdict(list)
+    seen: set = set()
     for issue in issues:
-        for f in issue.source_files or ["(未知文件)"]:
-            groups[f].append(issue)
+        key = id(issue)
+        if key in seen:
+            continue
+        if issue.source_files:
+            groups[issue.source_files[0]].append(issue)
+        else:
+            groups["(未知文件)"].append(issue)
+        seen.add(key)
     return dict(groups)
 
 
@@ -49,6 +56,7 @@ def _group_by_ending(issues: List[Issue]) -> Dict[str, List[Issue]]:
     """
     按结局分组（使用 issue.related_endings）。
     一个问题可能属于多个结局，会出现在多个分组中。
+    没有关联结局的问题按消息中的结局关键词做最后尝试。
     """
     groups: Dict[str, List[Issue]] = defaultdict(list)
     uncategorized: List[Issue] = []
@@ -57,7 +65,19 @@ def _group_by_ending(issues: List[Issue]) -> Dict[str, List[Issue]]:
             for ending in issue.related_endings:
                 groups[ending].append(issue)
         else:
-            uncategorized.append(issue)
+            from .checkers import issue_unique_key
+            matched = False
+            all_ending_names = set()
+            for other in issues:
+                if other.related_endings:
+                    all_ending_names.update(other.related_endings)
+            for ending_name in all_ending_names:
+                ending_core = ending_name.replace("结局", "").replace("结束", "")
+                if ending_core and ending_core in issue.message:
+                    groups[ending_name].append(issue)
+                    matched = True
+            if not matched:
+                uncategorized.append(issue)
     if uncategorized:
         groups["(未关联结局)"] = uncategorized
     return dict(groups)
@@ -400,6 +420,34 @@ def export_html(
   .tab-content {{ display: none; }}
   .tab-content.active {{ display: block; }}
   .config-section {{ margin-top: 20px; }}
+  .review-fields {{
+    margin-top: 12px; padding-top: 10px;
+    border-top: 1px dashed #e0e0e0;
+  }}
+  .review-row {{
+    display: flex; gap: 12px; align-items: center; margin: 4px 0;
+    flex-wrap: wrap;
+  }}
+  .review-input {{
+    border: 1px solid #e0e0e0; border-radius: 4px;
+    padding: 4px 8px; font-size: 0.88em;
+    font-family: inherit;
+  }}
+  .review-assignee {{ width: 140px; }}
+  .review-status {{ width: auto; min-width: 100px; }}
+  .review-notes {{ flex: 1; min-width: 200px; resize: vertical; }}
+  .review-actions {{
+    margin: 20px 0; padding: 12px;
+    background: #f5f0fa; border-radius: 8px;
+    text-align: center;
+  }}
+  .btn-export {{
+    background: var(--accent); color: white;
+    border: none; border-radius: 6px;
+    padding: 8px 20px; font-size: 0.95em;
+    cursor: pointer; margin: 0 8px;
+  }}
+  .btn-export:hover {{ opacity: 0.9; }}
 </style>
 </head>
 <body>
@@ -448,7 +496,16 @@ def export_html(
 
     html += f"""
 <h2>{detail_title}</h2>
-<div class="tab-bar">
+"""
+
+    if review_mode:
+        html += """<div class="review-actions">
+  <button class="btn-export" onclick="exportReviewJSON()">导出审阅备注 (JSON)</button>
+  <span style="color:var(--muted);font-size:0.85em;">填写每条问题的负责人/状态/备注后，点击导出</span>
+</div>
+"""
+
+    html += """<div class="tab-bar">
   <button class="tab-btn active" onclick="switchGroup('type')">按问题类型</button>
   <button class="tab-btn" onclick="switchGroup('file')">按章节文件</button>
   <button class="tab-btn" onclick="switchGroup('ending')">按结局</button>
@@ -517,13 +574,30 @@ def export_html(
                         html += f'<div class="issue-field"><b>修复建议：</b>{issue.suggestion}</div>\n'
 
                     if issue.choice_chain or issue.path_segment:
-                        summary_text = "📜 展开技术细节（选择链/路线片段）" if review_mode else "📜 展开完整路径上下文（点击展开/收起）"
+                        summary_text = "展开技术细节（选择链/路线片段）" if review_mode else "展开完整路径上下文（点击展开/收起）"
                         html += f"<details>\n<summary>{summary_text}</summary>\n"
                         if issue.choice_chain:
                             html += f'<p><b>玩家选择链：</b></p>\n<pre>{issue.choice_chain}</pre>\n'
                         if issue.path_segment:
                             html += f'<p><b>完整路线片段：</b></p>\n<pre>{issue.path_segment}</pre>\n'
                         html += "</details>\n"
+
+                    if review_mode:
+                        ikey = issue_unique_key(issue)
+                        html += f'<div class="review-fields" data-issue-key="{_escape_md(ikey)}">\n'
+                        html += f'  <div class="review-row">\n'
+                        html += f'    <label>负责人：<input type="text" class="review-input review-assignee" placeholder="指派负责人" /></label>\n'
+                        html += f'    <label>状态：<select class="review-input review-status">\n'
+                        html += f'      <option value="pending">待处理</option>\n'
+                        html += f'      <option value="in_progress">处理中</option>\n'
+                        html += f'      <option value="fixed">已修复</option>\n'
+                        html += f'      <option value="ignored">忽略</option>\n'
+                        html += f'    </select></label>\n'
+                        html += f'  </div>\n'
+                        html += f'  <div class="review-row">\n'
+                        html += f'    <textarea class="review-input review-notes" placeholder="备注信息" rows="1"></textarea>\n'
+                        html += f'  </div>\n'
+                        html += f'</div>\n'
 
                     html += "</div>\n"
                     global_idx += 1
@@ -551,9 +625,85 @@ function switchGroup(name) {
   document.getElementById('group-' + name).classList.add('active');
   event.target.classList.add('active');
 }
+"""
+
+    if review_mode:
+        html += """
+function exportReviewJSON() {
+  var items = [];
+  document.querySelectorAll('.review-fields').forEach(function(el) {
+    var key = el.getAttribute('data-issue-key');
+    var assignee = el.querySelector('.review-assignee').value;
+    var status = el.querySelector('.review-status').value;
+    var notes = el.querySelector('.review-notes').value;
+    if (assignee || status !== 'pending' || notes) {
+      items.push({key: key, assignee: assignee, status: status, notes: notes});
+    }
+  });
+  var blob = new Blob([JSON.stringify({review_notes: items, exported_at: new Date().toISOString()}, null, 2)],
+                      {type: 'application/json'});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = 'review_notes.json'; a.click();
+  URL.revokeObjectURL(url);
+}
+"""
+
+    html += """
 </script>
 </body>
 </html>
 """
 
     Path(output_path).write_text(html, encoding="utf-8")
+
+
+def export_review_json(
+    report: CheckReport,
+    output_path: str,
+) -> None:
+    """导出轻量审阅备注 JSON（供编剧和关卡策划对齐用）
+
+    每条问题只包含：类型、严重程度、描述、关联结局、涉及章节、建议、唯一键。
+    不含选择链、路线片段等命令行技术细节。
+    """
+    items = []
+    for idx, issue in enumerate(report.issues, 1):
+        unique_files = []
+        for f in issue.source_files:
+            if f not in unique_files:
+                unique_files.append(f)
+        items.append({
+            "idx": idx,
+            "key": issue_unique_key(issue),
+            "type": issue.issue_type,
+            "severity": issue.severity,
+            "message": issue.message,
+            "related_endings": issue.related_endings,
+            "source_files": [Path(f).name for f in unique_files],
+            "suggestion": issue.suggestion,
+            "is_baseline": issue.is_baseline,
+            "review": {
+                "assignee": "",
+                "status": "pending",
+                "notes": "",
+            },
+        })
+
+    data = {
+        "path": report.file_path,
+        "generated_at": __import__('datetime').datetime.now().isoformat(),
+        "summary": {
+            "total_issues": len(report.issues),
+            "new_issues": len(report.new_issues),
+            "baseline_issues": len(report.baseline_issues),
+            "errors": len(report.errors),
+            "warnings": len(report.warnings),
+        },
+        "issues": items,
+    }
+
+    Path(output_path).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )

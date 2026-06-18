@@ -2,6 +2,7 @@
 
 import sys
 import os
+import json
 import time
 import tempfile
 from pathlib import Path
@@ -400,6 +401,201 @@ class TestBackwardCompatibility(unittest.TestCase):
         outline = parse_outline_text(text)
         issues = check_weak_foreshadowing(outline, traverse_all_paths(outline))
         self.assertTrue(any("母亲是凶手" in i.message for i in issues))
+
+
+class TestEndingGrouping(unittest.TestCase):
+    """按结局分组：条件冲突的 related_endings 不为空，不进入未关联分组"""
+
+    def test_conflict_has_related_endings(self):
+        """条件冲突问题通过父链回溯获得关联结局"""
+        text = """开始
+    获得日记 @item:+日记
+        @choice:烧毁日记
+            烧掉日记 @item:-日记
+                阅读灰烬 @cond:日记
+                    @ending:灰烬结局
+        @choice:保留日记
+            阅读日记
+                @ending:真相结局"""
+        outline = parse_outline_text(text)
+        report = run_all_checks(outline)
+        conflicts = [i for i in report.issues if i.issue_type == "条件冲突"]
+        if conflicts:
+            self.assertTrue(
+                conflicts[0].related_endings,
+                f"条件冲突问题应有关联结局，实际: {conflicts[0].related_endings}"
+            )
+
+    def test_file_grouping_no_duplicates(self):
+        """按章节分组时每条问题只出现一次"""
+        text = """开始
+    获得日记 @item:+日记
+        @choice:烧毁日记
+            烧掉日记 @item:-日记
+                阅读灰烬 @cond:日记
+                    @ending:灰烬结局"""
+        outline = parse_outline_text(text)
+        report = run_all_checks(outline)
+        from chainchecker.exporter import _group_by_file
+        groups = _group_by_file(report.issues)
+        total = sum(len(v) for v in groups.values())
+        self.assertEqual(total, len(report.issues),
+                         f"按章节分组后问题总数应等于原问题数: {total} vs {len(report.issues)}")
+
+    def test_md_html_issue_count_match(self):
+        """MD 和 HTML 活动分组中的问题数一致"""
+        text = """开始
+    @choice:左
+        @ending:结局A @truth:母亲是凶手
+    @choice:右
+        @ending:结局B"""
+        outline = parse_outline_text(text)
+        report = run_all_checks(outline)
+        from chainchecker.exporter import export_markdown, export_html, _group_by_type, _group_by_file, _group_by_ending
+        grouping_funcs = {"type": _group_by_type, "file": _group_by_file, "ending": _group_by_ending}
+        with tempfile.TemporaryDirectory() as td:
+            for group_by in ["type", "file", "ending"]:
+                md_path = os.path.join(td, f"t_{group_by}.md")
+                html_path = os.path.join(td, f"t_{group_by}.html")
+                export_markdown(report, md_path, group_by=group_by, review_mode=True)
+                export_html(report, html_path, group_by=group_by, review_mode=True)
+                md = Path(md_path).read_text(encoding="utf-8")
+                md_count = md.count("[错误]") + md.count("[警告]") + md.count("[提示]")
+                expected = sum(len(v) for v in grouping_funcs[group_by](report.issues).values())
+                self.assertEqual(md_count, expected,
+                                 f"group_by={group_by}: MD({md_count}) != expected({expected})")
+
+
+class TestReviewNotes(unittest.TestCase):
+    """审阅备注功能测试"""
+
+    def test_review_html_has_editable_fields(self):
+        """审阅版 HTML 包含可编辑的负责人/状态/备注字段"""
+        text = """开始
+    @ending:结局 @truth:母亲是凶手"""
+        outline = parse_outline_text(text)
+        report = run_all_checks(outline)
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
+            path = f.name
+        try:
+            from chainchecker.exporter import export_html
+            export_html(report, path, review_mode=True)
+            content = Path(path).read_text(encoding="utf-8")
+            self.assertIn("review-assignee", content)
+            self.assertIn("review-status", content)
+            self.assertIn("review-notes", content)
+            self.assertIn("exportReviewJSON", content)
+        finally:
+            os.unlink(path)
+
+    def test_export_review_json(self):
+        """导出审阅备注 JSON"""
+        text = """开始
+    @ending:结局 @truth:母亲是凶手"""
+        outline = parse_outline_text(text)
+        report = run_all_checks(outline)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w", encoding="utf-8") as f:
+            path = f.name
+        try:
+            from chainchecker.exporter import export_review_json
+            export_review_json(report, path)
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertIn("issues", data)
+            self.assertIn("summary", data)
+            self.assertTrue(len(data["issues"]) > 0)
+            issue = data["issues"][0]
+            self.assertIn("key", issue)
+            self.assertIn("review", issue)
+            self.assertEqual(issue["review"]["status"], "pending")
+        finally:
+            os.unlink(path)
+
+
+class TestMultiBaseline(unittest.TestCase):
+    """多基线支持测试"""
+
+    def test_save_and_load_named_baseline(self):
+        """保存和加载命名基线"""
+        from chainchecker.checkers import save_baseline, load_baseline, BaselineComparison, apply_baseline
+        text = """开始
+    @ending:结局 @truth:母亲是凶手"""
+        outline = parse_outline_text(text)
+        report = run_all_checks(outline)
+
+        with tempfile.TemporaryDirectory() as td:
+            bl_path = os.path.join(td, "baseline.json")
+            save_baseline(report, bl_path, name="test_baseline", tag="弱铺垫")
+            keys = load_baseline(bl_path, name="test_baseline")
+            self.assertIsNotNone(keys)
+            self.assertTrue(len(keys) > 0)
+
+    def test_multiple_baselines_in_one_file(self):
+        """一个基线文件保存多条基线"""
+        from chainchecker.checkers import save_baseline, load_baseline, list_baselines
+        text = """开始
+    @ending:结局 @truth:母亲是凶手"""
+        outline = parse_outline_text(text)
+        report = run_all_checks(outline)
+
+        with tempfile.TemporaryDirectory() as td:
+            bl_path = os.path.join(td, "baseline.json")
+            save_baseline(report, bl_path, name="v1_弱铺垫", tag="弱铺垫")
+            save_baseline(report, bl_path, name="v1_冲突", tag="条件冲突")
+
+            baselines = list_baselines(bl_path)
+            self.assertEqual(len(baselines), 2)
+            names = [bl.name for bl in baselines]
+            self.assertIn("v1_弱铺垫", names)
+            self.assertIn("v1_冲突", names)
+
+            keys1 = load_baseline(bl_path, name="v1_弱铺垫")
+            keys2 = load_baseline(bl_path, name="v1_冲突")
+            self.assertIsNotNone(keys1)
+            self.assertIsNotNone(keys2)
+
+    def test_baseline_comparison_with_fixed(self):
+        """基线对比显示新增/旧账/已修复"""
+        from chainchecker.checkers import save_baseline, load_baseline, apply_baseline
+        text1 = """开始
+    @ending:结局A @truth:秘密A
+    @ending:结局B @truth:秘密B"""
+        outline1 = parse_outline_text(text1)
+        report1 = run_all_checks(outline1)
+
+        with tempfile.TemporaryDirectory() as td:
+            bl_path = os.path.join(td, "baseline.json")
+            save_baseline(report1, bl_path, name="initial")
+
+            text2 = """开始
+    @clue:秘密A的提示
+    @ending:结局A @truth:秘密A
+    @ending:结局B @truth:秘密B"""
+            outline2 = parse_outline_text(text2)
+            report2 = run_all_checks(outline2)
+
+            baseline_keys = load_baseline(bl_path, name="initial")
+            self.assertIsNotNone(baseline_keys)
+            comparison = apply_baseline(report2, baseline_keys)
+            self.assertIsInstance(comparison.new_count, int)
+            self.assertIsInstance(comparison.baseline_count, int)
+            self.assertIsInstance(comparison.fixed_count, int)
+            self.assertEqual(comparison.new_count + comparison.baseline_count, len(report2.issues))
+
+    def test_backward_compat_old_baseline_format(self):
+        """旧的 v1 格式基线文件仍然可以加载"""
+        from chainchecker.checkers import load_baseline
+        old_format = {
+            "version": 1,
+            "issue_count": 1,
+            "issues": [{"key": "test|msg|file|1", "issue_type": "test", "severity": "error",
+                         "message": "msg", "source_files": ["file"], "line_numbers": [1]}]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            bl_path = os.path.join(td, "baseline.json")
+            Path(bl_path).write_text(json.dumps(old_format, ensure_ascii=False), encoding="utf-8")
+            keys = load_baseline(bl_path)
+            self.assertIsNotNone(keys)
+            self.assertIn("test|msg|file|1", keys)
 
 
 if __name__ == "__main__":
