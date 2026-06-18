@@ -29,6 +29,7 @@ class Node:
     truths: Set[str] = field(default_factory=set)
     choice_label: Optional[str] = None
     goto_target: Optional[str] = None  # 跨文件跳转目标
+    is_entry: bool = False  # 是否为独立入口（目录模式下也从这里开始）
 
     @property
     def is_ending(self) -> bool:
@@ -75,6 +76,7 @@ class ParsedOutline:
     is_multi_file: bool = False
     files: Dict[str, 'ParsedOutline'] = field(default_factory=dict)
     file_order: List[str] = field(default_factory=list)  # 文件名按章节顺序排列
+    entry_node_ids: List[str] = field(default_factory=list)  # 所有入口节点（第一章根 + @entry 标记的节点）
 
     def get_node(self, node_id: str) -> Optional[Node]:
         return self.nodes.get(node_id)
@@ -113,6 +115,7 @@ PATTERN_CLUE = re.compile(r'@clue:([^@]+?)(?=@|$)')
 PATTERN_TRUTH = re.compile(r'@truth:([^@]+?)(?=@|$)')
 PATTERN_CHOICE = re.compile(r'@choice:([^@]+?)(?=@|$)')
 PATTERN_GOTO = re.compile(r'@goto:([^@\s]+)')  # 跨文件跳转
+PATTERN_ENTRY = re.compile(r'@entry(\s|$|@)')  # 独立入口标记
 
 
 def _parse_markers(text: str, node: Node) -> None:
@@ -145,6 +148,8 @@ def _parse_markers(text: str, node: Node) -> None:
     for m in PATTERN_GOTO.finditer(text):
         node.goto_target = m.group(1).strip()
         node.node_type = "goto"
+    if PATTERN_ENTRY.search(text):
+        node.is_entry = True
 
     if node.is_ending:
         node.node_type = "ending"
@@ -190,7 +195,7 @@ def _parse_single_file(
         if stripped.startswith('//') or stripped.startswith('#'):
             if not any(tag in stripped for tag in [
                 '@item:', '@flag:', '@cond:', '@ending:',
-                '@clue:', '@truth:', '@choice:', '@goto:', '@label:'
+                '@clue:', '@truth:', '@choice:', '@goto:', '@label:', '@entry'
             ]):
                 continue
 
@@ -289,7 +294,11 @@ def parse_chapter_directory(dir_path: str, file_pattern: str = "*.md") -> Parsed
     """
     解析一个章节目录下的所有文件。
     文件名按自然排序（chap1.md, chap2.md...）作为章节顺序。
-    一个文件的叶子节点（无子节点且非结局）会自动连接到下一个文件的根节点，形成跨章节连续剧情。
+
+    入口规则：
+    - 默认只从**第一章**（排序第一个文件）的根节点开始串完整路线
+    - 其他章节中显式标记 @entry 的根节点也作为独立入口（适合支线、闪回章节）
+    - 一个文件的叶子节点（无子节点且非结局）会自动连接到下一个文件的根节点，形成跨章节连续剧情。
     """
     dir_p = Path(dir_path)
     if not dir_p.is_dir():
@@ -321,6 +330,30 @@ def parse_chapter_directory(dir_path: str, file_pattern: str = "*.md") -> Parsed
         for nid, node in outline.nodes.items():
             multi_outline.nodes[nid] = node
         multi_outline.root_ids.extend(outline.root_ids)
+
+    # ===== 关键：确定入口节点 =====
+    # 1. 第一章（排序第一的文件）的所有根节点都是入口
+    first_file_name = file_outlines[0][0] if file_outlines else None
+    first_file_outline = file_outlines[0][1] if file_outlines else None
+    if first_file_outline:
+        for root_id in first_file_outline.root_ids:
+            if root_id not in multi_outline.entry_node_ids:
+                multi_outline.entry_node_ids.append(root_id)
+
+    # 2. 其他文件的根节点只有标记了 @entry 的才算入口
+    for idx, (source_name, outline, _) in enumerate(file_outlines):
+        if idx == 0:
+            continue  # 第一章已经处理过了
+        for root_id in outline.root_ids:
+            node = multi_outline.get_node(root_id)
+            if node and node.is_entry:
+                if root_id not in multi_outline.entry_node_ids:
+                    multi_outline.entry_node_ids.append(root_id)
+
+    # 3. 非根节点但标记了 @entry 的也要加进来（章节内部的入口）
+    for nid, node in multi_outline.nodes.items():
+        if node.is_entry and nid not in multi_outline.entry_node_ids:
+            multi_outline.entry_node_ids.append(nid)
 
     # 处理 @goto 跳转：连接 goto 节点到目标节点
     for nid, node in multi_outline.nodes.items():

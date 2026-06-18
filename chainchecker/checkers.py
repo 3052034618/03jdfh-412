@@ -207,6 +207,38 @@ def _clue_matches_truth(clue: str, truth: str, config: Optional[CheckerConfig]) 
     return matches >= threshold
 
 
+import fnmatch
+
+def _apply_filters_and_overrides(issues: List[Issue], config: Optional[CheckerConfig]) -> List[Issue]:
+    """对问题列表应用过滤（结局/文件）和严重程度覆盖"""
+    result: List[Issue] = []
+    for issue in issues:
+        # 1. 结局路径过滤（通过问题消息中的结局名判断）
+        if config and config.only_check_endings:
+            if issue.issue_type != "条件冲突":
+                matched = False
+                for pattern in config.only_check_endings:
+                    if fnmatch.fnmatch(issue.message, f"*{pattern}*"):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+
+        # 2. 文件过滤
+        if config and config.only_check_files and issue.source_files:
+            if not any(config.should_check_file(sf) for sf in issue.source_files):
+                continue
+
+        # 3. 严重程度覆盖
+        if config:
+            issue.severity = config.override_severity(
+                issue.issue_type, issue.message, issue.severity
+            )
+
+        result.append(issue)
+    return result
+
+
 def _should_ignore(issue: Issue, config: Optional[CheckerConfig]) -> bool:
     """根据配置判断是否应该忽略此问题"""
     if config is None:
@@ -272,15 +304,24 @@ def check_unreachable_endings(
 
 
 def _find_sample_path_to_node(outline: ParsedOutline, target: Node) -> List[str]:
-    """从根节点到目标节点的一条示例路径（用于不可达结局显示参考路径）"""
+    """从入口节点到目标节点的一条示例路径（用于不可达结局显示参考路径）"""
     from collections import deque
 
-    for root_id in outline.root_ids:
-        if outline.is_multi_file and outline.get_node(root_id) and outline.get_node(root_id).parent is not None:
-            continue
+    # 确定起点
+    start_ids: List[str] = []
+    if outline.is_multi_file and outline.entry_node_ids:
+        start_ids = list(outline.entry_node_ids)
+    else:
+        for root_id in outline.root_ids:
+            if outline.is_multi_file:
+                root_node = outline.get_node(root_id)
+                if root_node and root_node.parent is not None:
+                    continue
+            start_ids.append(root_id)
 
+    for start_id in start_ids:
         queue: deque = deque()
-        queue.append([root_id])
+        queue.append([start_id])
         visited: Set[str] = set()
 
         while queue:
@@ -330,24 +371,29 @@ def _static_traverse_for_conflicts(
     outline: ParsedOutline,
     node_id: str,
     items_state: Set[str],
-    removed_items: Dict[str, Tuple[int, str]],  # item -> (line, file)
+    removed_items: Dict[str, Tuple[int, str, int]],  # item -> (line, file, visit_order)
     flags_state: Set[str],
-    cleared_flags: Dict[str, Tuple[int, str]],
+    cleared_flags: Dict[str, Tuple[int, str, int]],
     item_action_history: List[Tuple[str, str, int, str]],
     flag_action_history: List[Tuple[str, str, int, str]],
     current_node_ids: List[str],
-    seen_conflicts: Set[Tuple[str, str, int, int]],
+    seen_conflicts: Set[Tuple[str, str, str, str]],
     issues: List[Issue],
     config: Optional[CheckerConfig],
+    visit_order: int = 0,
 ) -> None:
     """
     静态DFS遍历所有分支（不做条件过滤），专门用于检测条件冲突。
     收紧规则：只有"失去后被后续条件依赖"才报 ERROR；正常 add->remove 一次性消耗不报。
+
+    visit_order 是全局递增的访问序号，用于跨章节判断"先失去后需要"的先后顺序
+    （因为每个文件的 line_number 是独立的，不能直接比较）
     """
     node = outline.get_node(node_id)
     if node is None:
         return
 
+    visit_order += 1
     new_node_ids = current_node_ids + [node_id]
 
     # 1. 检查当前节点的条件是否与状态冲突（失去物品后又需要）
@@ -369,28 +415,28 @@ def _static_traverse_for_conflicts(
                     break
 
             if not has_item:
-                # 检查是否曾经被移除过
-                for rm_item, (rm_line, rm_file) in removed_items.items():
+                # 检查是否曾经被移除过（用 visit_order 判断先后，跨文件也安全）
+                for rm_item, (rm_line, rm_file, rm_order) in removed_items.items():
                     rm_resolved = config.resolve_item_name(rm_item) if config else rm_item
-                    if rm_resolved == resolved and rm_line < node.line_number:
-                        key = ("item_lost_cond", resolved, rm_line, node.line_number)
+                    if rm_resolved == resolved and rm_order < visit_order:
+                        key = ("item_lost_cond", resolved, rm_file + ":" + str(rm_line), node.source_file + ":" + str(node.line_number))
                         if key not in seen_conflicts:
                             seen_conflicts.add(key)
 
                             # 构造路径片段和选择链
-                            path_seg = _format_node_path(outline, new_node_ids[-8:])  # 最近8个节点
+                            path_seg = _format_node_path(outline, new_node_ids[-8:])
                             choice_chain = _format_node_choices(outline, new_node_ids)
 
                             issue = Issue(
                                 issue_type="条件冲突",
                                 severity="error",
-                                message=f"物品「{item_name}」在行{rm_line}被失去/烧毁/消耗，但在行{node.line_number}的条件中仍然需要它",
+                                message=f"物品「{item_name}」在{Path(rm_file).name}:{rm_line}被失去/烧毁/消耗，但在{Path(node.source_file).name}:{node.line_number}的条件中仍然需要它",
                                 line_numbers=[rm_line, node.line_number],
                                 source_files=[rm_file, node.source_file],
-                                details=f"路径中失去物品后，后续节点要求该物品存在，逻辑矛盾",
+                                details=f"路径中失去物品后，后续节点要求该物品存在，逻辑矛盾（跨章节检测）",
                                 path_segment=path_seg,
                                 choice_chain=choice_chain,
-                                suggestion=f"在行{rm_line}后移除对「{item_name}」的条件要求，或在行{rm_line}处不要失去该物品"
+                                suggestion=f"在{Path(rm_file).name}:{rm_line}后移除对「{item_name}」的条件要求，或在那里不要失去该物品"
                             )
                             if not _should_ignore(issue, config):
                                 issues.append(issue)
@@ -416,7 +462,7 @@ def _static_traverse_for_conflicts(
         items_to_remove = [it for it in new_items if (config.resolve_item_name(it) if config else it) == resolved]
         for it in items_to_remove:
             new_items.discard(it)
-        new_removed[item] = (node.line_number, node.source_file)
+        new_removed[item] = (node.line_number, node.source_file, visit_order)  # 记录访问序号
         new_item_hist.append(("remove", item, node.line_number, node.source_file))
 
     new_flags = set(flags_state)
@@ -424,13 +470,15 @@ def _static_traverse_for_conflicts(
     new_flag_hist = list(flag_action_history)
 
     for flag in node.flags_set:
-        new_cleared.pop(flag, None)
+        keys_to_remove = [k for k in new_cleared if k == flag]
+        for k in keys_to_remove:
+            del new_cleared[k]
         new_flags.add(flag)
         new_flag_hist.append(("set", flag, node.line_number, node.source_file))
 
     for flag in node.flags_clear:
         new_flags.discard(flag)
-        new_cleared[flag] = (node.line_number, node.source_file)
+        new_cleared[flag] = (node.line_number, node.source_file, visit_order)
         new_flag_hist.append(("clear", flag, node.line_number, node.source_file))
 
     # 3. 递归子节点
@@ -441,7 +489,8 @@ def _static_traverse_for_conflicts(
             new_flags, new_cleared,
             new_item_hist, new_flag_hist,
             new_node_ids,
-            seen_conflicts, issues, config
+            seen_conflicts, issues, config,
+            visit_order  # 父节点的 visit_order 作为子节点的基数
         )
 
 
@@ -455,23 +504,32 @@ def check_conflicts(
     - 只报 ERROR：物品被"消耗"（失去）后，后续路径的条件又需要它
     - 正常的 add->remove 一次性消耗不报（除非配置为非忽略项且后续有依赖）
     - 物品/标记的 set->clear 序列也只在后续有依赖时报
+    - 多文件模式下从正确的入口开始静态遍历
     """
     issues: List[Issue] = []
-    seen_conflicts: Set[Tuple[str, str, int, int]] = set()
+    seen_conflicts: Set[Tuple[str, str, str, str]] = set()
 
-    for root_id in outline.root_ids:
-        if outline.is_multi_file:
-            root_node = outline.get_node(root_id)
-            if root_node and root_node.parent is not None:
-                continue
+    # ===== 确定起点：优先用 entry_node_ids =====
+    start_ids: List[str] = []
+    if outline.is_multi_file and outline.entry_node_ids:
+        start_ids = list(outline.entry_node_ids)
+    else:
+        for root_id in outline.root_ids:
+            if outline.is_multi_file:
+                root_node = outline.get_node(root_id)
+                if root_node and root_node.parent is not None:
+                    continue
+            start_ids.append(root_id)
 
+    for start_id in start_ids:
         _static_traverse_for_conflicts(
-            outline, root_id,
+            outline, start_id,
             set(), {},
             set(), {},
             [], [],
             [],
-            seen_conflicts, issues, config
+            seen_conflicts, issues, config,
+            visit_order=0
         )
 
     return issues
@@ -593,26 +651,30 @@ def run_all_checks(
     all_ending_names = set()
     for node in all_ending_nodes:
         for ending_name in node.endings:
-            if not config.should_ignore_ending(ending_name):
+            if not config.should_ignore_ending(ending_name) and config.should_check_ending(ending_name):
                 all_ending_names.add(ending_name)
 
     report = CheckReport(
         file_path=outline.file_path,
         total_endings=len(all_ending_names),
-        reachable_endings=len(traversal.reachable_endings),
+        reachable_endings=sum(1 for e in traversal.reachable_endings
+                              if config.should_check_ending(e) and not config.should_ignore_ending(e)),
         total_paths=len(traversal.all_paths),
         is_multi_file=outline.is_multi_file
     )
 
     # 填充结局跨文件映射
     for ending_name in traversal.ending_file_map:
-        if not config.should_ignore_ending(ending_name):
+        if config.should_check_ending(ending_name) and not config.should_ignore_ending(ending_name):
             report.ending_file_map[ending_name] = list(traversal.ending_file_map[ending_name])
 
     issues: List[Issue] = []
     issues.extend(check_unreachable_endings(outline, traversal, config))
     issues.extend(check_conflicts(outline, traversal, config))
     issues.extend(check_weak_foreshadowing(outline, traversal, config))
+
+    # 应用过滤和严重程度覆盖
+    issues = _apply_filters_and_overrides(issues, config)
 
     # 按严重程度排序，同类型按行号
     severity_order = {"error": 0, "warning": 1, "info": 2}

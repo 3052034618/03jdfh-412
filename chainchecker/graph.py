@@ -274,6 +274,7 @@ def traverse_all_paths(
 ) -> TraversalResult:
     """
     BFS遍历所有可能的有效路径。
+    多文件模式下优先使用 entry_node_ids（第一章根 + @entry 节点）作为起点。
     每个节点如果有条件且不满足，则该路径在此终止（不进入此分支）。
     """
     result = TraversalResult()
@@ -281,17 +282,27 @@ def traverse_all_paths(
 
     queue: deque = deque()
 
-    for root_id in outline.root_ids:
-        root = outline.get_node(root_id)
+    # ===== 确定起点：优先用 entry_node_ids，否则回退 root_ids =====
+    start_ids: List[str] = []
+    if outline.is_multi_file and outline.entry_node_ids:
+        start_ids = list(outline.entry_node_ids)
+    else:
+        for root_id in outline.root_ids:
+            root = outline.get_node(root_id)
+            if root is None:
+                continue
+            # 单文件 / 向后兼容：只遍历真正起点（没有父节点的）
+            if outline.is_multi_file and root.parent is not None:
+                continue
+            start_ids.append(root_id)
+
+    for start_id in start_ids:
+        root = outline.get_node(start_id)
         if root is None:
             continue
 
-        # 多文件模式下，只遍历作为真正起点的根（没有父节点的）
-        if outline.is_multi_file and root.parent is not None:
-            continue
-
         path = PathRecord()
-        path.node_ids.append(root_id)
+        path.node_ids.append(start_id)
         path.line_numbers.append(root.line_number)
         path.source_files.append(root.source_file)
 

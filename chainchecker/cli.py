@@ -1,4 +1,4 @@
-"""命令行界面（增强版）- 支持目录检查、配置文件、路径片段"""
+"""命令行界面（完整版）- 支持目录检查、配置、路径片段、watch、导出"""
 
 import sys
 import argparse
@@ -9,6 +9,8 @@ from typing import List
 from .parser import parse_outline, parse_chapter_directory
 from .checkers import run_all_checks, CheckReport, Issue
 from .config import CheckerConfig, DEFAULT_CONFIG_FILENAME
+from .exporter import export_markdown, export_html
+from .watcher import run_watch
 
 
 def print_help_syntax() -> None:
@@ -28,6 +30,7 @@ def print_help_syntax() -> None:
   @truth:真相描述     关键真相（如 @truth:母亲是井中怨灵）
   @label:标签名       跨文件跳转定位锚点
   @goto:标签名        跳转到指定标签（跨文件跳转）
+  @entry              标记为独立入口（目录模式从这里也开始）
 
 缩进说明:
   使用缩进来表示父子关系（每级4空格或1个Tab）。
@@ -35,8 +38,20 @@ def print_help_syntax() -> None:
 
 跨文件说明:
   目录中的文件按文件名自然排序（chap1.md → chap2.md）。
+  默认只从第一章（排序第一个文件）的根节点开始串完整路线。
+  其他章节可使用 @entry 标记独立入口（适合支线、闪回）。
   一个文件的非结局叶子节点会自动连接到下一个文件的根节点。
   可使用 @label 和 @goto 实现显式跳转。
+
+配置文件说明 (.chaincheck.json):
+  item_synonyms    物品同义词（如 "破损铃铛" <-> "铃铛碎片"）
+  truth_keywords   真相关键词列表（增强铺垫匹配）
+  ignore_items     一次性道具列表（add->remove 不报冲突）
+  ignore_rules     忽略规则（支持通配符 + 到期时间）
+  severity_overrides  严重程度覆盖规则
+  only_check_endings 只检查某些结局（草稿分批推进）
+  only_check_files    只检查某些章节
+  draft_mode/strict_mode  草稿/严格模式
 """)
 
 
@@ -46,12 +61,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="多结局因果链检查助手 - 检查恐怖游戏大纲的逻辑完整性",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
-  chaincheck outline.md                 # 检查单个文件
-  chaincheck chapters/                  # 检查整个章节目录
-  chaincheck chapters/ --json           # JSON格式输出
-  chaincheck outline.md --no-details    # 简洁输出（无选择链/路线片段）
-  chaincheck --init-config              # 生成默认配置文件
-  chaincheck chapters/ --config my.json # 使用指定配置文件
+  chaincheck outline.md                          检查单个文件
+  chaincheck chapters/                           检查整个章节目录
+  chaincheck chapters/ --watch                   Watch 模式，边写边检查
+  chaincheck chapters/ --export-md report.md     导出 Markdown 报告
+  chaincheck chapters/ --export-html report.html 导出 HTML 报告发给同事
+  chaincheck chapters/ --group ending            按结局分组显示问题
+  chaincheck outline.md --no-details             简洁输出
+  chaincheck --init-config                       生成默认配置文件
+  chaincheck chapters/ --config my.json          使用指定配置文件
+  chaincheck chapters/ --strict                  严格模式（警告=错误）
+  chaincheck chapters/ --draft                   草稿模式（警告降级）
+  chaincheck chapters/ --only-ending "*结局A*"   只检查某条结局线
 """
     )
     parser.add_argument(
@@ -90,6 +111,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="严格模式，将警告也视为错误（退出码非0）"
     )
     parser.add_argument(
+        "--draft",
+        action="store_true",
+        help="草稿模式，弱化警告为提示（适合大纲初期）"
+    )
+    parser.add_argument(
         "--no-details",
         action="store_true",
         help="简洁模式，不显示选择链和路线片段"
@@ -98,6 +124,48 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--pattern",
         default="*.md",
         help="目录扫描的文件匹配模式（默认: *.md）"
+    )
+    parser.add_argument(
+        "--group",
+        choices=["type", "file", "ending"],
+        default="type",
+        help="导出报告时的分组方式（默认:按问题类型）"
+    )
+    parser.add_argument(
+        "--watch", "-w",
+        action="store_true",
+        help="Watch 模式：文件变动自动重新检查，只显示变化的问题"
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=1.0,
+        metavar="SECONDS",
+        help="Watch 模式轮询间隔秒数（默认 1.0）"
+    )
+    parser.add_argument(
+        "--export-md",
+        metavar="FILE",
+        help="导出 Markdown 格式报告到指定文件"
+    )
+    parser.add_argument(
+        "--export-html",
+        metavar="FILE",
+        help="导出 HTML 格式报告到指定文件（含交互折叠，适合分享）"
+    )
+    parser.add_argument(
+        "--only-ending",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="只检查匹配的结局（可多次指定，支持通配符），适合分批推进"
+    )
+    parser.add_argument(
+        "--only-file",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="只检查匹配的文件（可多次指定，支持通配符）"
     )
     return parser
 
@@ -162,7 +230,7 @@ def main(argv: List[str] | None = None) -> int:
                 return 0
         CheckerConfig.create_default(str(config_path))
         print(f"✅ 已生成默认配置文件: {config_path}")
-        print("请根据需要修改同义词、关键词和忽略规则。")
+        print("请根据需要修改同义词、关键词、忽略规则和项目级设置。")
         return 0
 
     if not args.path:
@@ -181,6 +249,27 @@ def main(argv: List[str] | None = None) -> int:
         print(f"[警告] 加载配置文件失败: {e}", file=sys.stderr)
         config = CheckerConfig()
 
+    # 应用 CLI 覆盖配置
+    if args.strict:
+        config.strict_mode = True
+    if args.draft:
+        config.draft_mode = True
+    if args.only_ending:
+        config.only_check_endings = list(config.only_check_endings) + args.only_ending
+    if args.only_file:
+        config.only_check_files = list(config.only_check_files) + args.only_file
+
+    # Watch 模式
+    if args.watch:
+        run_watch(
+            target=str(input_path),
+            config_path=args.config,
+            pattern=args.pattern,
+            poll_interval=args.interval,
+            show_details=not args.no_details,
+        )
+        return 0
+
     # 解析大纲
     try:
         if input_path.is_dir():
@@ -196,15 +285,25 @@ def main(argv: List[str] | None = None) -> int:
     # 运行检查
     report = run_all_checks(outline, config)
 
-    if args.quiet and not report.issues:
+    # 导出
+    if args.export_md:
+        export_markdown(report, args.export_md, args.group, outline, config)
+        print(f"✅ Markdown 报告已导出到: {args.export_md}")
+    if args.export_html:
+        export_html(report, args.export_html, args.group, outline, config)
+        print(f"✅ HTML 报告已导出到: {args.export_html}")
+
+    if args.quiet and not report.issues and not args.json:
         return 0
 
     # 输出
     if args.json:
-        import io
-        # 确保输出 UTF-8 编码
+        # 确保 UTF-8
         json_output = json.dumps(_report_to_json(report), ensure_ascii=False, indent=2)
-        sys.stdout.reconfigure(encoding='utf-8')
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+        except Exception:
+            pass
         print(json_output)
     else:
         print(report.format(show_details=not args.no_details))
