@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>剧本因果链审阅报告</title>
+<style>
+  :root {
+    --error-color: #e53935;
+    --warning-color: #f9a825;
+    --info-color: #1e88e5;
+    --success-color: #43a047;
+    --bg: #fafafa;
+    --card-bg: #ffffff;
+    --text: #212121;
+    --muted: #757575;
+    --border: #e0e0e0;
+    --accent: #6a1b9a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text);
+    margin: 0; padding: 24px; line-height: 1.6;
+  }
+  h1 { color: var(--accent); border-bottom: 3px solid var(--accent); padding-bottom: 8px; }
+  h2 { margin-top: 32px; color: #424242; }
+  h3 { color: #616161; }
+  .meta { color: var(--muted); font-size: 0.9em; margin-bottom: 24px; }
+  .summary-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px; margin: 20px 0;
+  }
+  .summary-card {
+    background: var(--card-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; text-align: center;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  .summary-card .num { font-size: 1.8em; font-weight: bold; }
+  .summary-card .label { font-size: 0.85em; color: var(--muted); }
+  .num.error { color: var(--error-color); }
+  .num.warning { color: var(--warning-color); }
+  .num.info { color: var(--info-color); }
+  .num.ok { color: var(--success-color); }
+  table {
+    width: 100%; border-collapse: collapse; margin: 16px 0;
+    background: var(--card-bg); border-radius: 8px; overflow: hidden;
+  }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: #f5f5f5; font-weight: 600; }
+  tr:hover td { background: #fafafa; }
+  .issue-card {
+    background: var(--card-bg); border: 1px solid var(--border);
+    border-left: 4px solid #9e9e9e;
+    border-radius: 6px; padding: 16px; margin: 14px 0;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  }
+  .issue-card.error { border-left-color: var(--error-color); }
+  .issue-card.warning { border-left-color: var(--warning-color); }
+  .issue-card.info { border-left-color: var(--info-color); }
+  .issue-title { font-size: 1.1em; font-weight: 600; margin-bottom: 8px; }
+  .issue-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 0.75em; font-weight: 600; margin-right: 8px;
+    color: white;
+  }
+  .badge-error { background: var(--error-color); }
+  .badge-warning { background: var(--warning-color); }
+  .badge-info { background: var(--info-color); }
+  .issue-loc { color: var(--muted); font-size: 0.85em; font-family: monospace; }
+  .issue-field { margin: 6px 0; }
+  .issue-field b { color: #424242; }
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.8em; background: #f0e6f7; color: var(--accent);
+    margin-right: 4px; margin-top: 2px;
+  }
+  details { margin-top: 12px; }
+  summary {
+    cursor: pointer; padding: 6px 0; font-weight: 500;
+    color: var(--accent); user-select: none;
+  }
+  summary:hover { text-decoration: underline; }
+  pre {
+    background: #263238; color: #eceff1; padding: 12px;
+    border-radius: 6px; overflow-x: auto; font-size: 0.88em;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .group-section {
+    background: #fff; border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; margin: 20px 0;
+  }
+  .group-title {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 1.15em; font-weight: 600; color: #424242;
+    padding-bottom: 10px; border-bottom: 2px solid #f0f0f0; margin-bottom: 10px;
+  }
+  .group-count { background: #eeeeee; padding: 2px 10px; border-radius: 10px; font-size: 0.8em; }
+  .success-box {
+    background: #e8f5e9; color: #2e7d32;
+    padding: 20px; border-radius: 8px; text-align: center;
+    font-size: 1.15em; font-weight: 600; margin: 20px 0;
+  }
+  .tab-bar { display: flex; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
+  .tab-btn {
+    padding: 8px 18px; border: 1px solid var(--border);
+    background: white; border-radius: 20px; cursor: pointer;
+    font-size: 0.9em; transition: all 0.15s;
+  }
+  .tab-btn:hover { background: #f5f5f5; }
+  .tab-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .config-section { margin-top: 20px; }
+</style>
+</head>
+<body>
+<h1>剧本因果链审阅报告</h1>
+<div class="meta">
+  🕒 生成时间：2026-06-19 04:30:23
+  &nbsp;|&nbsp; 📂 检查对象：<code>chapters</code>
+  
+</div>
+
+<h2>📊 总览</h2>
+<div class="summary-grid">
+  <div class="summary-card"><div class="num">6</div><div class="label">结局总数</div></div>
+  <div class="summary-card"><div class="num ok">5</div><div class="label">✅ 可达结局</div></div>
+  <div class="summary-card"><div class="num error">1</div><div class="label">❌ 不可达</div></div>
+  
+  <div class="summary-card"><div class="num error">2</div><div class="label">🔴 错误</div></div>
+  <div class="summary-card"><div class="num warning">0</div><div class="label">🟡 警告</div></div>
+  <div class="summary-card"><div class="num info">0</div><div class="label">🔵 提示</div></div>
+  <div class="summary-card"><div class="num" style="color:var(--accent);">2</div><div class="label">问题合计</div></div>
+</div>
+<h2>🗂️ 结局跨章节分布</h2>
+<table>
+<tr><th>结局名称</th><th>跨越章节</th><th>章节数</th></tr>
+<tr><td><b>井中永生结局</b></td><td><code>chap3_jieju.md</code> &nbsp;→&nbsp; <code>chap2_zhenxiang.md</code> &nbsp;→&nbsp; <code>chap1_laozhai.md</code></td><td>3</td></tr>
+<tr><td><b>井底真相结局</b></td><td><code>chap3_jieju.md</code> &nbsp;→&nbsp; <code>chap2_zhenxiang.md</code> &nbsp;→&nbsp; <code>chap1_laozhai.md</code></td><td>3</td></tr>
+<tr><td><b>坠入深渊结局</b></td><td><code>chap3_jieju.md</code> &nbsp;→&nbsp; <code>chap2_zhenxiang.md</code> &nbsp;→&nbsp; <code>chap1_laozhai.md</code></td><td>3</td></tr>
+<tr><td><b>被母亲带走结局</b></td><td><code>chap3_jieju.md</code> &nbsp;→&nbsp; <code>chap2_zhenxiang.md</code> &nbsp;→&nbsp; <code>chap1_laozhai.md</code></td><td>3</td></tr>
+<tr><td><b>逃离老宅结局</b></td><td><code>chap3_jieju.md</code> &nbsp;→&nbsp; <code>chap2_zhenxiang.md</code> &nbsp;→&nbsp; <code>chap1_laozhai.md</code></td><td>3</td></tr>
+</table>
+
+<h2>🔍 问题清单</h2>
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchGroup('type')">按问题类型</button>
+  <button class="tab-btn" onclick="switchGroup('file')">按章节文件</button>
+  <button class="tab-btn" onclick="switchGroup('ending')">按结局</button>
+</div>
+<div id="group-type" class="tab-content ">
+<div class="group-section">
+<div class="group-title"><span>📌 类型：不可达结局</span><span class="group-count">1 条</span></div>
+<div class="issue-card error">
+<div class="issue-title"><span class="issue-badge badge-error">错误</span>不可达结局 <span class="issue-loc">(chap3_jieju.md, L26)</span> · #1</div>
+<div class="issue-field"><b>问题描述：</b>结局「隐藏真相结局」没有任何有效路径可以到达</div>
+<div class="issue-field"><b>关联结局：</b><span class="tag">隐藏真相结局</span></div>
+<div class="issue-field"><b>涉及章节：</b>chap3_jieju.md</div>
+<div class="issue-field"><b>修复建议：</b>检查进入该结局的条件是否能被满足，或者是否有选择分支能够通向该结局</div>
+<details>
+<summary>📜 展开技术细节（选择链/路线片段）</summary>
+<p><b>玩家选择链：</b></p>
+<pre>  [chap1_laozhai.md:7] 选择「去卧室」
+  [chap1_laozhai.md:9] 选择「阅读日记」
+  [chap3_jieju.md:24] 选择「打开地下室」</pre>
+<p><b>完整路线片段：</b></p>
+<pre>  ↳ [chap1_laozhai.md:4] 第一章 老宅
+  ↳ [chap1_laozhai.md:5] 主角回到已故母亲的老宅，整理遗物。
+  ↳ [chap1_laozhai.md:6] 打开门厅抽屉
+  ↳ [chap1_laozhai.md:7] 选择:去卧室
+  ↳ [chap1_laozhai.md:8] 翻找床头柜
+  ↳ [chap1_laozhai.md:9] 选择:阅读日记
+  ↳ [chap1_laozhai.md:10] @clue:日记记载母亲年轻时曾在井下工作
+  ↳ [chap1_laozhai.md:11] @flag:读过日记
+  ↳ [chap2_zhenxiang.md:21] 前往第三章
+  ↳ [chap3_jieju.md:4] 第三章 结局
+  ↳ [chap3_jieju.md:24] 选择:打开地下室
+  ↳ [chap3_jieju.md:25] 条件:地下室钥匙
+  ↳ [chap3_jieju.md:26] 结局:隐藏真相结局</pre>
+</details>
+</div>
+</div>
+<div class="group-section">
+<div class="group-title"><span>📌 类型：条件冲突</span><span class="group-count">1 条</span></div>
+<div class="issue-card error">
+<div class="issue-title"><span class="issue-badge badge-error">错误</span>条件冲突 <span class="issue-loc">(chap1_laozhai.md, chap1_laozhai.md, L13,14)</span> · #2</div>
+<div class="issue-field"><b>问题描述：</b>物品「日记」在chap1_laozhai.md:13被失去/烧毁/消耗，但在chap1_laozhai.md:14的条件中仍然需要它</div>
+<div class="issue-field"><b>涉及章节：</b>chap1_laozhai.md、chap1_laozhai.md</div>
+<div class="issue-field"><b>修复建议：</b>在chap1_laozhai.md:13后移除对「日记」的条件要求，或在那里不要失去该物品</div>
+<details>
+<summary>📜 展开技术细节（选择链/路线片段）</summary>
+<p><b>玩家选择链：</b></p>
+<pre>  [chap1_laozhai.md:7] 选择「去卧室」
+  [chap1_laozhai.md:12] 选择「烧毁日记」</pre>
+<p><b>完整路线片段：</b></p>
+<pre>  ↳ [chap1_laozhai.md:4] 第一章 老宅
+  ↳ [chap1_laozhai.md:5] 主角回到已故母亲的老宅，整理遗物。
+  ↳ [chap1_laozhai.md:6] 打开门厅抽屉
+  ↳ [chap1_laozhai.md:7] 选择:去卧室
+  ↳ [chap1_laozhai.md:8] 翻找床头柜
+  ↳ [chap1_laozhai.md:12] 选择:烧毁日记
+  ↳ [chap1_laozhai.md:13] 烧掉日记
+  ↳ [chap1_laozhai.md:14] 条件:日记</pre>
+</details>
+</div>
+</div>
+</div>
+<div id="group-file" class="tab-content ">
+<div class="group-section">
+<div class="group-title"><span>📌 章节：chap1_laozhai.md</span><span class="group-count">2 条</span></div>
+<div class="issue-card error">
+<div class="issue-title"><span class="issue-badge badge-error">错误</span>条件冲突 <span class="issue-loc">(chap1_laozhai.md, chap1_laozhai.md, L13,14)</span> · #1</div>
+<div class="issue-field"><b>问题描述：</b>物品「日记」在chap1_laozhai.md:13被失去/烧毁/消耗，但在chap1_laozhai.md:14的条件中仍然需要它</div>
+<div class="issue-field"><b>涉及章节：</b>chap1_laozhai.md、chap1_laozhai.md</div>
+<div class="issue-field"><b>修复建议：</b>在chap1_laozhai.md:13后移除对「日记」的条件要求，或在那里不要失去该物品</div>
+<details>
+<summary>📜 展开技术细节（选择链/路线片段）</summary>
+<p><b>玩家选择链：</b></p>
+<pre>  [chap1_laozhai.md:7] 选择「去卧室」
+  [chap1_laozhai.md:12] 选择「烧毁日记」</pre>
+<p><b>完整路线片段：</b></p>
+<pre>  ↳ [chap1_laozhai.md:4] 第一章 老宅
+  ↳ [chap1_laozhai.md:5] 主角回到已故母亲的老宅，整理遗物。
+  ↳ [chap1_laozhai.md:6] 打开门厅抽屉
+  ↳ [chap1_laozhai.md:7] 选择:去卧室
+  ↳ [chap1_laozhai.md:8] 翻找床头柜
+  ↳ [chap1_laozhai.md:12] 选择:烧毁日记
+  ↳ [chap1_laozhai.md:13] 烧掉日记
+  ↳ [chap1_laozhai.md:14] 条件:日记</pre>
+</details>
+</div>
+<div class="issue-card error">
+<div class="issue-title"><span class="issue-badge badge-error">错误</span>条件冲突 <span class="issue-loc">(chap1_laozhai.md, chap1_laozhai.md, L13,14)</span> · #2</div>
+<div class="issue-field"><b>问题描述：</b>物品「日记」在chap1_laozhai.md:13被失去/烧毁/消耗，但在chap1_laozhai.md:14的条件中仍然需要它</div>
+<div class="issue-field"><b>涉及章节：</b>chap1_laozhai.md、chap1_laozhai.md</div>
+<div class="issue-field"><b>修复建议：</b>在chap1_laozhai.md:13后移除对「日记」的条件要求，或在那里不要失去该物品</div>
+<details>
+<summary>📜 展开技术细节（选择链/路线片段）</summary>
+<p><b>玩家选择链：</b></p>
+<pre>  [chap1_laozhai.md:7] 选择「去卧室」
+  [chap1_laozhai.md:12] 选择「烧毁日记」</pre>
+<p><b>完整路线片段：</b></p>
+<pre>  ↳ [chap1_laozhai.md:4] 第一章 老宅
+  ↳ [chap1_laozhai.md:5] 主角回到已故母亲的老宅，整理遗物。
+  ↳ [chap1_laozhai.md:6] 打开门厅抽屉
+  ↳ [chap1_laozhai.md:7] 选择:去卧室
+  ↳ [chap1_laozhai.md:8] 翻找床头柜
+  ↳ [chap1_laozhai.md:12] 选择:烧毁日记
+  ↳ [chap1_laozhai.md:13] 烧掉日记
+  ↳ [chap1_laozhai.md:14] 条件:日记</pre>
+</details>
+</div>
+</div>
+<div class="group-section">
+<div class="group-title"><span>📌 章节：chap3_jieju.md</span><span class="group-count">1 条</span></div>
+<div class="issue-card error">
+<div class="issue-title"><span class="issue-badge badge-error">错误</span>不可达结局 <span class="issue-loc">(chap3_jieju.md, L26)</span> · #3</div>
+<div class="issue-field"><b>问题描述：</b>结局「隐藏真相结局」没有任何有效路径可以到达</div>
+<div class="issue-field"><b>关联结局：</b><span class="tag">隐藏真相结局</span></div>
+<div class="issue-field"><b>涉及章节：</b>chap3_jieju.md</div>
+<div class="issue-field"><b>修复建议：</b>检查进入该结局的条件是否能被满足，或者是否有选择分支能够通向该结局</div>
+<details>
+<summary>📜 展开技术细节（选择链/路线片段）</summary>
+<p><b>玩家选择链：</b></p>
+<pre>  [chap1_laozhai.md:7] 选择「去卧室」
+  [chap1_laozhai.md:9] 选择「阅读日记」
+  [chap3_jieju.md:24] 选择「打开地下室」</pre>
+<p><b>完整路线片段：</b></p>
+<pre>  ↳ [chap1_laozhai.md:4] 第一章 老宅
+  ↳ [chap1_laozhai.md:5] 主角回到已故母亲的老宅，整理遗物。
+  ↳ [chap1_laozhai.md:6] 打开门厅抽屉
+  ↳ [chap1_laozhai.md:7] 选择:去卧室
+  ↳ [chap1_laozhai.md:8] 翻找床头柜
+  ↳ [chap1_laozhai.md:9] 选择:阅读日记
+  ↳ [chap1_laozhai.md:10] @clue:日记记载母亲年轻时曾在井下工作
+  ↳ [chap1_laozhai.md:11] @flag:读过日记
+  ↳ [chap2_zhenxiang.md:21] 前往第三章
+  ↳ [chap3_jieju.md:4] 第三章 结局
+  ↳ [chap3_jieju.md:24] 选择:打开地下室
+  ↳ [chap3_jieju.md:25] 条件:地下室钥匙
+  ↳ [chap3_jieju.md:26] 结局:隐藏真相结局</pre>
+</details>
+</div>
+</div>
+</div>
+<div id="group-ending" class="tab-content active">
+<div class="group-section">
+<div class="group-title"><span>📌 结局：(未关联结局)</span><span class="group-count">1 条</span></div>
+<div class="issue-card error">
+<div class="issue-title"><span class="issue-badge badge-error">错误</span>条件冲突 <span class="issue-loc">(chap1_laozhai.md, chap1_laozhai.md, L13,14)</span> · #1</div>
+<div class="issue-field"><b>问题描述：</b>物品「日记」在chap1_laozhai.md:13被失去/烧毁/消耗，但在chap1_laozhai.md:14的条件中仍然需要它</div>
+<div class="issue-field"><b>涉及章节：</b>chap1_laozhai.md、chap1_laozhai.md</div>
+<div class="issue-field"><b>修复建议：</b>在chap1_laozhai.md:13后移除对「日记」的条件要求，或在那里不要失去该物品</div>
+<details>
+<summary>📜 展开技术细节（选择链/路线片段）</summary>
+<p><b>玩家选择链：</b></p>
+<pre>  [chap1_laozhai.md:7] 选择「去卧室」
+  [chap1_laozhai.md:12] 选择「烧毁日记」</pre>
+<p><b>完整路线片段：</b></p>
+<pre>  ↳ [chap1_laozhai.md:4] 第一章 老宅
+  ↳ [chap1_laozhai.md:5] 主角回到已故母亲的老宅，整理遗物。
+  ↳ [chap1_laozhai.md:6] 打开门厅抽屉
+  ↳ [chap1_laozhai.md:7] 选择:去卧室
+  ↳ [chap1_laozhai.md:8] 翻找床头柜
+  ↳ [chap1_laozhai.md:12] 选择:烧毁日记
+  ↳ [chap1_laozhai.md:13] 烧掉日记
+  ↳ [chap1_laozhai.md:14] 条件:日记</pre>
+</details>
+</div>
+</div>
+<div class="group-section">
+<div class="group-title"><span>📌 结局：隐藏真相结局</span><span class="group-count">1 条</span></div>
+<div class="issue-card error">
+<div class="issue-title"><span class="issue-badge badge-error">错误</span>不可达结局 <span class="issue-loc">(chap3_jieju.md, L26)</span> · #2</div>
+<div class="issue-field"><b>问题描述：</b>结局「隐藏真相结局」没有任何有效路径可以到达</div>
+<div class="issue-field"><b>关联结局：</b><span class="tag">隐藏真相结局</span></div>
+<div class="issue-field"><b>涉及章节：</b>chap3_jieju.md</div>
+<div class="issue-field"><b>修复建议：</b>检查进入该结局的条件是否能被满足，或者是否有选择分支能够通向该结局</div>
+<details>
+<summary>📜 展开技术细节（选择链/路线片段）</summary>
+<p><b>玩家选择链：</b></p>
+<pre>  [chap1_laozhai.md:7] 选择「去卧室」
+  [chap1_laozhai.md:9] 选择「阅读日记」
+  [chap3_jieju.md:24] 选择「打开地下室」</pre>
+<p><b>完整路线片段：</b></p>
+<pre>  ↳ [chap1_laozhai.md:4] 第一章 老宅
+  ↳ [chap1_laozhai.md:5] 主角回到已故母亲的老宅，整理遗物。
+  ↳ [chap1_laozhai.md:6] 打开门厅抽屉
+  ↳ [chap1_laozhai.md:7] 选择:去卧室
+  ↳ [chap1_laozhai.md:8] 翻找床头柜
+  ↳ [chap1_laozhai.md:9] 选择:阅读日记
+  ↳ [chap1_laozhai.md:10] @clue:日记记载母亲年轻时曾在井下工作
+  ↳ [chap1_laozhai.md:11] @flag:读过日记
+  ↳ [chap2_zhenxiang.md:21] 前往第三章
+  ↳ [chap3_jieju.md:4] 第三章 结局
+  ↳ [chap3_jieju.md:24] 选择:打开地下室
+  ↳ [chap3_jieju.md:25] 条件:地下室钥匙
+  ↳ [chap3_jieju.md:26] 结局:隐藏真相结局</pre>
+</details>
+</div>
+</div>
+</div>
+
+<script>
+function switchGroup(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('group-' + name).classList.add('active');
+  event.target.classList.add('active');
+}
+</script>
+</body>
+</html>

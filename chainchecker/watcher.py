@@ -83,10 +83,29 @@ def _detect_changes(
     return (len(changed) > 0, changed)
 
 
-def _run_check(target_path: Path, config_path: Optional[str], pattern: str) -> Optional[CheckReport]:
-    """运行一次检查"""
+def _run_check(
+    target_path: Path,
+    config_path: Optional[str],
+    pattern: str,
+    draft_mode: bool = False,
+    strict_mode: bool = False,
+    only_endings: Optional[List[str]] = None,
+    only_files: Optional[List[str]] = None,
+) -> Optional[CheckReport]:
+    """运行一次检查（每次重新加载配置文件，CLI 参数优先级最高）"""
     try:
         config = CheckerConfig.load(config_path) if config_path else CheckerConfig.load()
+
+        # CLI 参数覆盖（优先级高于配置文件）
+        if draft_mode:
+            config.draft_mode = True
+        if strict_mode:
+            config.strict_mode = True
+        if only_endings is not None:
+            config.only_check_endings = list(only_endings)
+        if only_files is not None:
+            config.only_check_files = list(only_files)
+
         if target_path.is_dir():
             outline = parse_chapter_directory(str(target_path), pattern)
         else:
@@ -179,9 +198,14 @@ def run_watch(
     pattern: str = "*.md",
     poll_interval: float = 1.0,
     show_details: bool = True,
+    draft_mode: bool = False,
+    strict_mode: bool = False,
+    only_endings: Optional[List[str]] = None,
+    only_files: Optional[List[str]] = None,
 ) -> None:
     """
     运行 watch 模式，轮询文件变化自动重检。
+    CLI 参数在整个 watch 会话中持续生效，配置文件修改后下次重检自动加载新配置。
 
     Args:
         target: 文件或目录路径
@@ -189,6 +213,10 @@ def run_watch(
         pattern: 目录下的文件匹配模式
         poll_interval: 轮询间隔秒数
         show_details: 是否显示选择链和路线片段
+        draft_mode: 草稿模式（CLI参数，优先级高于配置文件）
+        strict_mode: 严格模式（CLI参数，优先级高于配置文件）
+        only_endings: 只检查指定结局（CLI参数）
+        only_files: 只检查指定文件（CLI参数）
     """
     target_path = Path(target)
     if not target_path.exists():
@@ -202,13 +230,26 @@ def run_watch(
     print(f"   监控对象: {target}")
     print(f"   文件模式: {pattern}")
     print(f"   轮询间隔: {poll_interval}s")
-    print("   💡 修改大纲文件后将自动重新检查")
+    if draft_mode:
+        print("   � 草稿模式: 已开启（警告降级为提示）")
+    if strict_mode:
+        print("   🚨 严格模式: 已开启（警告升级为错误）")
+    if only_endings:
+        print(f"   🎯 只检查结局: {', '.join(only_endings)}")
+    if only_files:
+        print(f"   📁 只检查文件: {', '.join(only_files)}")
+    print("   �💡 修改大纲文件后将自动重新检查")
+    print("   💡 配置文件修改后下次重检自动生效")
     print("   💡 按 Ctrl+C 退出 watch 模式")
     print("=" * 70)
 
     # 首次运行（完整报告）
     print("\n▶ 首次检查...")
-    report = _run_check(target_path, config_path, pattern)
+    report = _run_check(
+        target_path, config_path, pattern,
+        draft_mode=draft_mode, strict_mode=strict_mode,
+        only_endings=only_endings, only_files=only_files,
+    )
     if report:
         state.run_count += 1
         state.last_report = report
@@ -229,7 +270,12 @@ def run_watch(
             if changed:
                 # 稍微等一下，确保文件写入完成
                 time.sleep(0.2)
-                report = _run_check(target_path, config_path, pattern)
+                # 配置文件变化时，重新加载配置（_run_check 内部每次都重新加载）
+                report = _run_check(
+                    target_path, config_path, pattern,
+                    draft_mode=draft_mode, strict_mode=strict_mode,
+                    only_endings=only_endings, only_files=only_files,
+                )
                 if report:
                     state.run_count += 1
                     _print_diff_report(

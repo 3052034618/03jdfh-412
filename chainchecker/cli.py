@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List
 
 from .parser import parse_outline, parse_chapter_directory
-from .checkers import run_all_checks, CheckReport, Issue
+from .checkers import run_all_checks, CheckReport, Issue, save_baseline, load_baseline, apply_baseline, BASELINE_FILENAME
 from .config import CheckerConfig, DEFAULT_CONFIG_FILENAME
 from .exporter import export_markdown, export_html
 from .watcher import run_watch
@@ -64,8 +64,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
   chaincheck outline.md                          检查单个文件
   chaincheck chapters/                           检查整个章节目录
   chaincheck chapters/ --watch                   Watch 模式，边写边检查
+  chaincheck chapters/ --watch --draft           Watch 模式 + 草稿模式（参数持续生效）
   chaincheck chapters/ --export-md report.md     导出 Markdown 报告
   chaincheck chapters/ --export-html report.html 导出 HTML 报告发给同事
+  chaincheck chapters/ --export-md report.md --review --group ending
+                                                 导出审阅版报告，按结局分组
   chaincheck chapters/ --group ending            按结局分组显示问题
   chaincheck outline.md --no-details             简洁输出
   chaincheck --init-config                       生成默认配置文件
@@ -73,6 +76,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
   chaincheck chapters/ --strict                  严格模式（警告=错误）
   chaincheck chapters/ --draft                   草稿模式（警告降级）
   chaincheck chapters/ --only-ending "*结局A*"   只检查某条结局线
+  chaincheck chapters/ --save-baseline           保存当前问题为基线
+  chaincheck chapters/ --compare-baseline        对比基线，只看新增问题
 """
     )
     parser.add_argument(
@@ -167,6 +172,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="PATTERN",
         help="只检查匹配的文件（可多次指定，支持通配符）"
     )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="审阅版输出/导出：只显示问题摘要、关联结局、章节和建议，适合发给编剧同事"
+    )
+    parser.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help="将当前检查结果保存为基线（后续只把新增问题视为失败）"
+    )
+    parser.add_argument(
+        "--compare-baseline",
+        action="store_true",
+        help="对比基线模式：只有新增问题会导致退出码非0，旧问题不影响"
+    )
+    parser.add_argument(
+        "--baseline-file",
+        metavar="FILE",
+        default=None,
+        help="指定基线文件路径（默认: .chaincheck.baseline.json）"
+    )
     return parser
 
 
@@ -183,6 +209,8 @@ def _report_to_json(report: CheckReport) -> dict:
             "suggestion": issue.suggestion,
             "choice_chain": issue.choice_chain,
             "path_segment": issue.path_segment,
+            "related_endings": issue.related_endings,
+            "is_baseline": issue.is_baseline,
         }
 
     result = {
@@ -196,6 +224,8 @@ def _report_to_json(report: CheckReport) -> dict:
             "errors_count": len(report.errors),
             "warnings_count": len(report.warnings),
             "infos_count": len(report.infos),
+            "new_issues_count": len(report.new_issues),
+            "baseline_issues_count": len(report.baseline_issues),
         },
         "ending_file_map": report.ending_file_map,
         "file_reports": {
@@ -267,6 +297,10 @@ def main(argv: List[str] | None = None) -> int:
             pattern=args.pattern,
             poll_interval=args.interval,
             show_details=not args.no_details,
+            draft_mode=args.draft,
+            strict_mode=args.strict,
+            only_endings=args.only_ending if args.only_ending else None,
+            only_files=args.only_file if args.only_file else None,
         )
         return 0
 
@@ -285,12 +319,31 @@ def main(argv: List[str] | None = None) -> int:
     # 运行检查
     report = run_all_checks(outline, config)
 
+    # ===== 基线功能 =====
+    baseline_path = args.baseline_file or str(Path.cwd() / BASELINE_FILENAME)
+
+    if args.save_baseline:
+        save_baseline(report, baseline_path)
+        print(f"✅ 已保存基线到: {baseline_path}")
+        print(f"   共 {len(report.issues)} 条问题已记录为基线")
+
+    if args.compare_baseline:
+        baseline_keys = load_baseline(baseline_path)
+        if baseline_keys is None:
+            print(f"[警告] 未找到基线文件: {baseline_path}", file=sys.stderr)
+            print("   使用 --save-baseline 先保存基线")
+        else:
+            new_count, baseline_count = apply_baseline(report, baseline_keys)
+            print(f"📊 基线对比：新增 {new_count} 条，基线旧问题 {baseline_count} 条")
+            if new_count == 0:
+                print("✅ 没有新增问题！")
+
     # 导出
     if args.export_md:
-        export_markdown(report, args.export_md, args.group, outline, config)
+        export_markdown(report, args.export_md, args.group, outline, config, review_mode=args.review)
         print(f"✅ Markdown 报告已导出到: {args.export_md}")
     if args.export_html:
-        export_html(report, args.export_html, args.group, outline, config)
+        export_html(report, args.export_html, args.group, outline, config, review_mode=args.review)
         print(f"✅ HTML 报告已导出到: {args.export_html}")
 
     if args.quiet and not report.issues and not args.json:
@@ -309,11 +362,19 @@ def main(argv: List[str] | None = None) -> int:
         print(report.format(show_details=not args.no_details))
 
     # 退出码
-    if report.errors:
-        return 1
-    if args.strict and report.warnings:
-        return 1
-    return 0
+    if args.compare_baseline and report.new_issues:
+        # 基线模式：只有新增问题导致非零退出码
+        if any(i.severity == "error" for i in report.new_issues):
+            return 1
+        if args.strict and any(i.severity == "warning" for i in report.new_issues):
+            return 1
+        return 0
+    else:
+        if report.errors:
+            return 1
+        if args.strict and report.warnings:
+            return 1
+        return 0
 
 
 if __name__ == "__main__":

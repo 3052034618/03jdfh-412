@@ -45,6 +45,24 @@ def _group_by_file(issues: List[Issue]) -> Dict[str, List[Issue]]:
     return dict(groups)
 
 
+def _group_by_ending(issues: List[Issue]) -> Dict[str, List[Issue]]:
+    """
+    按结局分组（使用 issue.related_endings）。
+    一个问题可能属于多个结局，会出现在多个分组中。
+    """
+    groups: Dict[str, List[Issue]] = defaultdict(list)
+    uncategorized: List[Issue] = []
+    for issue in issues:
+        if issue.related_endings:
+            for ending in issue.related_endings:
+                groups[ending].append(issue)
+        else:
+            uncategorized.append(issue)
+    if uncategorized:
+        groups["(未关联结局)"] = uncategorized
+    return dict(groups)
+
+
 def _format_issue_md(issue: Issue, idx: int, collapsible: bool = True) -> str:
     """格式化单条问题为 Markdown（支持折叠）"""
     icon = _severity_icon(issue.severity)
@@ -94,12 +112,61 @@ def _format_issue_md(issue: Issue, idx: int, collapsible: bool = True) -> str:
     return header + body + "\n---\n\n"
 
 
+def _format_issue_md_review(issue: Issue, idx: int) -> str:
+    """格式化单条问题为 Markdown 审阅版（简洁，适合编剧看）"""
+    icon = _severity_icon(issue.severity)
+    sev_label = _severity_label_cn(issue.severity)
+
+    header = f"### {idx}. {icon} [{sev_label}] {_escape_md(issue.issue_type)}\n\n"
+    header += f"**问题描述**：{_escape_md(issue.message)}\n\n"
+
+    # 关联结局
+    if issue.related_endings:
+        endings_str = "、".join(f"「{_escape_md(e)}」" for e in issue.related_endings)
+        header += f"**关联结局**：{endings_str}\n\n"
+
+    # 涉及章节
+    if issue.source_files:
+        unique_files = []
+        for f in issue.source_files:
+            if f not in unique_files:
+                unique_files.append(f)
+        files_str = "、".join(Path(f).name for f in unique_files)
+        header += f"**涉及章节**：{files_str}\n\n"
+
+    # 修复建议
+    if issue.suggestion:
+        header += f"**修复建议**：{_escape_md(issue.suggestion)}\n\n"
+
+    # 折叠：技术详情（选择链 + 路线片段）
+    has_details = issue.choice_chain or issue.path_segment
+    if has_details:
+        body = "<details>\n"
+        body += "<summary>查看技术细节（选择链/路线片段）</summary>\n\n"
+        if issue.choice_chain:
+            body += "**玩家选择链**：\n\n"
+            body += "```text\n"
+            body += issue.choice_chain
+            body += "\n```\n\n"
+        if issue.path_segment:
+            body += "**完整路线片段**：\n\n"
+            body += "```text\n"
+            body += issue.path_segment
+            body += "\n```\n\n"
+        body += "</details>\n"
+    else:
+        body = ""
+
+    return header + body + "\n---\n\n"
+
+
 def export_markdown(
     report: CheckReport,
     output_path: str,
     group_by: str = "type",  # type, file, ending
     outline: Optional[ParsedOutline] = None,
     config: Optional[CheckerConfig] = None,
+    review_mode: bool = False,
 ) -> None:
     """导出为 Markdown 格式报告
 
@@ -109,9 +176,11 @@ def export_markdown(
         group_by: 分组方式 - "type"（按问题类型）、"file"（按章节文件）、"ending"（按结局）
         outline: 可选，用于提取更多结局信息
         config: 可选，显示使用的配置摘要
+        review_mode: 审阅版 - 简洁输出，适合发给编剧同事
     """
     md_lines: List[str] = []
-    md_lines.append("# 因果链检查报告\n")
+    title = "剧本因果链审阅报告" if review_mode else "因果链检查报告"
+    md_lines.append(f"# {title}\n")
     md_lines.append(f"> 生成时间：{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     md_lines.append(f"> 检查对象：`{report.file_path}`\n")
 
@@ -121,7 +190,8 @@ def export_markdown(
     summary_table += f"| 结局总数 | {report.total_endings} |\n"
     summary_table += f"| ✅ 可达结局 | {report.reachable_endings} |\n"
     summary_table += f"| ❌ 不可达结局 | {report.total_endings - report.reachable_endings} |\n"
-    summary_table += f"| 有效路径数 | {report.total_paths} |\n"
+    if not review_mode:
+        summary_table += f"| 有效路径数 | {report.total_paths} |\n"
     summary_table += f"| 🔴 错误 | {len(report.errors)} |\n"
     summary_table += f"| 🟡 警告 | {len(report.warnings)} |\n"
     summary_table += f"| 🔵 提示 | {len(report.infos)} |\n"
@@ -137,8 +207,8 @@ def export_markdown(
             ending_table += f"| {_escape_md(ending)} | {' → '.join(_escape_md(f) for f in files)} | {len(files)} |\n"
         md_lines.append(ending_table + "\n")
 
-    # ===== 各章节问题汇总表 =====
-    if report.is_multi_file and report.file_reports:
+    # ===== 各章节问题汇总表（非审阅版）=====
+    if not review_mode and report.is_multi_file and report.file_reports:
         md_lines.append("## 📁 各章节问题汇总\n")
         file_table = "| 章节文件 | 错误 | 警告 | 提示 | 合计 |\n|----------|------|------|------|------|\n"
         for fp in sorted(report.file_reports.keys()):
@@ -151,7 +221,8 @@ def export_markdown(
         md_lines.append(file_table + "\n")
 
     # ===== 问题详情分组 =====
-    md_lines.append("## 🔍 问题详情\n")
+    detail_title = "🔍 问题详情" if not review_mode else "🔍 问题清单"
+    md_lines.append(f"## {detail_title}\n")
 
     if not report.issues:
         md_lines.append("🎉 **未发现问题，大纲逻辑完整！**\n")
@@ -166,14 +237,7 @@ def export_markdown(
             issue_groups = _group_by_file(report.issues)
             group_title_prefix = "章节"
         elif group_by == "ending":
-            # 按结局分组：从消息中提取结局名
-            ending_groups: Dict[str, List[Issue]] = defaultdict(list)
-            for issue in report.issues:
-                import re
-                m = re.search(r'[「『]([^」』]+)[』」]', issue.message)
-                key = m.group(1) if m else issue.issue_type
-                ending_groups[key].append(issue)
-            issue_groups = dict(ending_groups)
+            issue_groups = _group_by_ending(report.issues)
             group_title_prefix = "结局"
 
         global_idx = 1
@@ -182,11 +246,14 @@ def export_markdown(
             # 显示分组标题，包含数量
             md_lines.append(f"### 📌 {group_title_prefix}：{_escape_md(group_key)} （{len(issues_in_group)} 条）\n")
             for sub_idx, issue in enumerate(issues_in_group, 1):
-                md_lines.append(_format_issue_md(issue, global_idx, collapsible=True))
+                if review_mode:
+                    md_lines.append(_format_issue_md_review(issue, global_idx))
+                else:
+                    md_lines.append(_format_issue_md(issue, global_idx, collapsible=True))
                 global_idx += 1
 
-    # ===== 配置摘要 =====
-    if config:
+    # ===== 配置摘要（非审阅版）=====
+    if not review_mode and config:
         md_lines.append("## ⚙️ 配置摘要\n")
         md_lines.append("<details><summary>查看本次检查使用的配置（点击展开）</summary>\n\n")
         md_lines.append("```json\n")
@@ -203,15 +270,27 @@ def export_html(
     group_by: str = "type",
     outline: Optional[ParsedOutline] = None,
     config: Optional[CheckerConfig] = None,
+    review_mode: bool = False,
 ) -> None:
-    """导出为 HTML 格式报告（美观可分享，含交互折叠）"""
+    """导出为 HTML 格式报告（美观可分享，含交互折叠）
+
+    Args:
+        report: 检查报告
+        output_path: 输出文件路径
+        group_by: 初始分组方式
+        outline: 可选，用于提取更多结局信息
+        config: 可选，显示使用的配置摘要
+        review_mode: 审阅版 - 简洁输出，适合发给编剧同事
+    """
+    title = "剧本因果链审阅报告" if review_mode else "🔗 因果链检查报告"
+    detail_title = "🔍 问题清单" if review_mode else "🔍 问题详情"
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>因果链检查报告</title>
+<title>{title}</title>
 <style>
   :root {{
     --error-color: #e53935;
@@ -279,6 +358,11 @@ def export_html(
   .issue-loc {{ color: var(--muted); font-size: 0.85em; font-family: monospace; }}
   .issue-field {{ margin: 6px 0; }}
   .issue-field b {{ color: #424242; }}
+  .tag {{
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.8em; background: #f0e6f7; color: var(--accent);
+    margin-right: 4px; margin-top: 2px;
+  }}
   details {{ margin-top: 12px; }}
   summary {{
     cursor: pointer; padding: 6px 0; font-weight: 500;
@@ -305,7 +389,7 @@ def export_html(
     padding: 20px; border-radius: 8px; text-align: center;
     font-size: 1.15em; font-weight: 600; margin: 20px 0;
   }}
-  .tab-bar {{ display: flex; gap: 8px; margin: 16px 0; }}
+  .tab-bar {{ display: flex; gap: 8px; margin: 16px 0; flex-wrap: wrap; }}
   .tab-btn {{
     padding: 8px 18px; border: 1px solid var(--border);
     background: white; border-radius: 20px; cursor: pointer;
@@ -319,7 +403,7 @@ def export_html(
 </style>
 </head>
 <body>
-<h1>🔗 因果链检查报告</h1>
+<h1>{title}</h1>
 <div class="meta">
   🕒 生成时间：{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
   &nbsp;|&nbsp; 📂 检查对象：<code>{report.file_path}</code>
@@ -331,7 +415,7 @@ def export_html(
   <div class="summary-card"><div class="num">{report.total_endings}</div><div class="label">结局总数</div></div>
   <div class="summary-card"><div class="num ok">{report.reachable_endings}</div><div class="label">✅ 可达结局</div></div>
   <div class="summary-card"><div class="num error">{report.total_endings - report.reachable_endings}</div><div class="label">❌ 不可达</div></div>
-  <div class="summary-card"><div class="num">{report.total_paths}</div><div class="label">有效路径</div></div>
+  {f'<div class="summary-card"><div class="num">{report.total_paths}</div><div class="label">有效路径</div></div>' if not review_mode else ''}
   <div class="summary-card"><div class="num error">{len(report.errors)}</div><div class="label">🔴 错误</div></div>
   <div class="summary-card"><div class="num warning">{len(report.warnings)}</div><div class="label">🟡 警告</div></div>
   <div class="summary-card"><div class="num info">{len(report.infos)}</div><div class="label">🔵 提示</div></div>
@@ -349,8 +433,8 @@ def export_html(
             html += f'<tr><td><b>{ending}</b></td><td>{chain}</td><td>{len(files)}</td></tr>\n'
         html += "</table>\n"
 
-    # 各章节问题汇总
-    if report.is_multi_file and report.file_reports:
+    # 各章节问题汇总（非审阅版）
+    if not review_mode and report.is_multi_file and report.file_reports:
         html += "<h2>📁 各章节问题汇总</h2>\n<table>\n"
         html += "<tr><th>章节文件</th><th>🔴 错误</th><th>🟡 警告</th><th>🔵 提示</th><th>合计</th></tr>\n"
         for fp in sorted(report.file_reports.keys()):
@@ -362,8 +446,8 @@ def export_html(
             html += f'<tr><td><code>{fname}</code></td><td>{errs}</td><td>{warns}</td><td>{infos}</td><td><b>{len(fr.issues)}</b></td></tr>\n'
         html += "</table>\n"
 
-    html += """
-<h2>🔍 问题详情</h2>
+    html += f"""
+<h2>{detail_title}</h2>
 <div class="tab-bar">
   <button class="tab-btn active" onclick="switchGroup('type')">按问题类型</button>
   <button class="tab-btn" onclick="switchGroup('file')">按章节文件</button>
@@ -378,18 +462,11 @@ def export_html(
         groups_config = {
             "type": _group_by_type(report.issues),
             "file": _group_by_file(report.issues),
+            "ending": _group_by_ending(report.issues),
         }
-        # ending 分组
-        import re
-        ending_groups: Dict[str, List[Issue]] = defaultdict(list)
-        for issue in report.issues:
-            m = re.search(r'[「『]([^」』]+)[』」]', issue.message)
-            key = m.group(1) if m else issue.issue_type
-            ending_groups[key].append(issue)
-        groups_config["ending"] = dict(ending_groups)
 
         for group_name, issue_groups in groups_config.items():
-            display = "active" if group_name == "type" else ""
+            display = "active" if group_name == group_by else ""
             html += f'<div id="group-{group_name}" class="tab-content {display}">\n'
 
             global_idx = 1
@@ -419,13 +496,29 @@ def export_html(
                     html += f'<div class="issue-card {issue.severity}">\n'
                     html += f'<div class="issue-title"><span class="issue-badge {badge_class}">{badge_text}</span>{issue.issue_type}{location} · #{global_idx}</div>\n'
                     html += f'<div class="issue-field"><b>问题描述：</b>{issue.message}</div>\n'
-                    if issue.details:
-                        html += f'<div class="issue-field"><b>详细信息：</b>{issue.details}</div>\n'
+
+                    # 审阅版：显示关联结局和涉及章节
+                    if review_mode:
+                        if issue.related_endings:
+                            endings_html = " ".join(f'<span class="tag">{e}</span>' for e in issue.related_endings)
+                            html += f'<div class="issue-field"><b>关联结局：</b>{endings_html}</div>\n'
+                        if issue.source_files:
+                            unique_files = []
+                            for f in issue.source_files:
+                                if f not in unique_files:
+                                    unique_files.append(f)
+                            files_str = "、".join(Path(f).name for f in unique_files)
+                            html += f'<div class="issue-field"><b>涉及章节：</b>{files_str}</div>\n'
+                    else:
+                        if issue.details:
+                            html += f'<div class="issue-field"><b>详细信息：</b>{issue.details}</div>\n'
+
                     if issue.suggestion:
                         html += f'<div class="issue-field"><b>修复建议：</b>{issue.suggestion}</div>\n'
 
                     if issue.choice_chain or issue.path_segment:
-                        html += "<details>\n<summary>📜 展开完整路径上下文（点击展开/收起）</summary>\n"
+                        summary_text = "📜 展开技术细节（选择链/路线片段）" if review_mode else "📜 展开完整路径上下文（点击展开/收起）"
+                        html += f"<details>\n<summary>{summary_text}</summary>\n"
                         if issue.choice_chain:
                             html += f'<p><b>玩家选择链：</b></p>\n<pre>{issue.choice_chain}</pre>\n'
                         if issue.path_segment:
@@ -438,8 +531,8 @@ def export_html(
                 html += "</div>\n"
             html += "</div>\n"
 
-    # 配置摘要
-    if config:
+    # 配置摘要（非审阅版）
+    if not review_mode and config:
         config_json = json.dumps(config.to_dict(), ensure_ascii=False, indent=2)
         html += f"""
 <div class="config-section">

@@ -280,8 +280,13 @@ class CheckerConfig:
 
     @classmethod
     def create_default(cls, path: str) -> None:
-        """创建增强版默认配置文件模板"""
+        """创建一份可直接编辑的示例配置文件模板（含项目级规则样例）
+
+        生成后的配置可以直接使用，不会报错。
+        用户可以根据项目需要增删规则。
+        """
         default = cls(
+            # ===== 基础配置 =====
             item_synonyms={
                 "破损铃铛": ["铃铛碎片", "铜铃", "铜铃碎片"],
                 "旧日记": ["日记", "灰烬日记", "残页"]
@@ -289,18 +294,50 @@ class CheckerConfig:
             truth_keywords=["母亲", "井", "铃", "凶手", "真相"],
             ignore_items=["火柴", "打火机", "一次性钥匙"],
             clue_match_threshold=1,
+
+            # ===== 项目级规则：忽略规则 =====
+            # 支持通配符匹配 + 到期时间 + 指定问题类型
+            # 到期后自动失效，适合草稿阶段分批推进
             ignore_rules=[
-                IgnoreRule(pattern="*测试*", issue_type="__ending__", reason="忽略测试结局"),
-                IgnoreRule(pattern="*草稿*", issue_type="__ending__", reason="忽略草稿结局"),
-                IgnoreRule(pattern="*弱铺垫*", expires="2026-12-31", reason="草稿阶段暂时忽略铺垫检查，年底前补完"),
+                IgnoreRule(
+                    pattern="*第3章*铺垫*",
+                    expires="2026-12-31",
+                    reason="第三章还在草稿阶段，铺垫问题年底前补完",
+                    issue_type="弱铺垫",
+                ),
+                IgnoreRule(
+                    pattern="*隐藏结局*",
+                    reason="隐藏结局暂不检查，留作彩蛋",
+                    issue_type="不可达结局",
+                ),
             ],
+
+            # ===== 项目级规则：严重程度覆盖 =====
+            # 可以将特定问题的严重程度升级或降级
             severity_overrides=[
-                SeverityOverride(issue_type="弱铺垫", pattern="*真相*", new_severity="error",
-                                 reason="关键真相的铺垫检查必须严格"),
+                SeverityOverride(
+                    issue_type="弱铺垫",
+                    pattern="*母亲*",
+                    new_severity="error",
+                ),
+                SeverityOverride(
+                    issue_type="条件冲突",
+                    pattern="*一次性*",
+                    new_severity="warning",
+                ),
             ],
-            only_check_endings=[],  # 空=检查全部
-            only_check_files=[],    # 空=检查全部
-            draft_mode=False,
-            strict_mode=False,
+
+            # ===== 项目级规则：分批推进 =====
+            # 只检查指定的结局/文件，草稿阶段可以分章节推进
+            only_check_endings=[],  # 空列表 = 检查全部结局
+            only_check_files=[],    # 空列表 = 检查全部文件
+
+            # ===== 项目级规则：模式切换 =====
+            draft_mode=False,   # 草稿模式：警告 → 提示，宽松检查
+            strict_mode=False,  # 严格模式：警告 → 错误，零容忍
+
+            # ===== 向后兼容的旧字段（已迁移到 ignore_rules）=====
+            ignore_issues=[],
+            ignore_endings=[],
         )
         default.save(path)

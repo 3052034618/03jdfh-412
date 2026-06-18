@@ -25,6 +25,9 @@ class Issue:
     path_segment: str = ""  # 从最后一个选择点到问题位置的路线片段
     choice_chain: str = ""  # 完整选择链
     related_paths: List[PathRecord] = field(default_factory=list)  # 相关路径（用于JSON输出）
+    related_endings: List[str] = field(default_factory=list)  # 关联的结局列表（审阅版用）
+    node_ids: List[str] = field(default_factory=list)  # 问题涉及的节点ID（用于结局关联）
+    is_baseline: bool = False  # 是否是基线中已有的旧问题
 
     def format(
         self,
@@ -103,6 +106,22 @@ class CheckReport:
     @property
     def infos(self) -> List[Issue]:
         return [i for i in self.issues if i.severity == "info"]
+
+    @property
+    def new_issues(self) -> List[Issue]:
+        return [i for i in self.issues if not i.is_baseline]
+
+    @property
+    def baseline_issues(self) -> List[Issue]:
+        return [i for i in self.issues if i.is_baseline]
+
+    @property
+    def new_errors(self) -> List[Issue]:
+        return [i for i in self.new_issues if i.severity == "error"]
+
+    @property
+    def baseline_errors(self) -> List[Issue]:
+        return [i for i in self.baseline_issues if i.severity == "error"]
 
     def get_issues_by_file(self, file_path: str) -> List[Issue]:
         """获取某个文件的所有问题"""
@@ -292,6 +311,8 @@ def check_unreachable_endings(
                 details=details,
                 suggestion="检查进入该结局的条件是否能被满足，或者是否有选择分支能够通向该结局"
             )
+            issue.node_ids = [n.id for n in nodes]
+            issue.related_endings = [ending_name]
 
             if sample_path:
                 issue.path_segment = _format_node_path(outline, sample_path)
@@ -438,6 +459,7 @@ def _static_traverse_for_conflicts(
                                 choice_chain=choice_chain,
                                 suggestion=f"在{Path(rm_file).name}:{rm_line}后移除对「{item_name}」的条件要求，或在那里不要失去该物品"
                             )
+                            issue.node_ids = [node_id]
                             if not _should_ignore(issue, config):
                                 issues.append(issue)
                         break
@@ -617,6 +639,7 @@ def check_weak_foreshadowing(
                         choice_chain=choice_chain,
                         suggestion=f"在到达该结局的路径中，提前添加 @clue 标记来暗示「{truth_text}」相关的信息"
                     )
+                    issue.related_endings = [ending_name]
 
                     if not _should_ignore(issue, config):
                         issues.append(issue)
@@ -635,6 +658,28 @@ def _build_file_reports(report: CheckReport, outline: ParsedOutline) -> None:
                 file_issues.append(issue)
         if file_issues or outline.is_multi_file:
             report.file_reports[fp] = FileReport(file_path=fp, issues=file_issues)
+
+
+def _fill_related_endings(report: CheckReport, traversal: TraversalResult) -> None:
+    """
+    根据遍历结果填充每个问题的 related_endings。
+    - 已有 related_endings 的（如不可达结局、弱铺垫）跳过
+    - 有 node_ids 的，通过遍历所有经过这些节点的路径来收集结局
+    """
+    for issue in report.issues:
+        if issue.related_endings:
+            continue
+        if not issue.node_ids:
+            continue
+
+        node_set = set(issue.node_ids)
+        endings: Set[str] = set()
+        for path in traversal.all_paths:
+            path_nodes = set(path.node_ids)
+            if node_set & path_nodes:
+                endings.update(path.reached_endings)
+
+        issue.related_endings = sorted(endings)
 
 
 def run_all_checks(
@@ -686,7 +731,79 @@ def run_all_checks(
 
     report.issues = issues
 
+    # 填充关联结局
+    _fill_related_endings(report, traversal)
+
     # 按文件汇总
     _build_file_reports(report, outline)
 
     return report
+
+
+# ============= 基线功能 =============
+
+BASELINE_FILENAME = ".chaincheck.baseline.json"
+
+
+def issue_unique_key(issue: Issue) -> str:
+    """生成问题的唯一标识键（用于基线对比）"""
+    lines_key = ",".join(str(l) for l in issue.line_numbers)
+    files_key = ",".join(Path(f).name for f in issue.source_files) if issue.source_files else ""
+    # 用类型+消息前80字+文件+行号作为唯一键
+    return f"{issue.issue_type}|{issue.message[:80]}|{files_key}|{lines_key}"
+
+
+def save_baseline(report: CheckReport, output_path: str = BASELINE_FILENAME) -> None:
+    """将当前报告的问题保存为基线文件"""
+    import json
+    baseline = {
+        "version": 1,
+        "issue_count": len(report.issues),
+        "issues": [
+            {
+                "key": issue_unique_key(issue),
+                "issue_type": issue.issue_type,
+                "severity": issue.severity,
+                "message": issue.message,
+                "source_files": issue.source_files,
+                "line_numbers": issue.line_numbers,
+                "related_endings": issue.related_endings,
+            }
+            for issue in report.issues
+        ]
+    }
+    Path(output_path).write_text(
+        json.dumps(baseline, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+
+def load_baseline(baseline_path: str = BASELINE_FILENAME) -> Optional[Set[str]]:
+    """加载基线文件，返回问题键的集合。文件不存在返回 None。"""
+    import json
+    path = Path(baseline_path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {item["key"] for item in data.get("issues", [])}
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def apply_baseline(report: CheckReport, baseline_keys: Set[str]) -> Tuple[int, int]:
+    """
+    将基线应用到报告上，标记 is_baseline。
+    返回 (新增问题数, 基线问题数)
+    """
+    new_count = 0
+    baseline_count = 0
+    for issue in report.issues:
+        key = issue_unique_key(issue)
+        if key in baseline_keys:
+            issue.is_baseline = True
+            baseline_count += 1
+        else:
+            issue.is_baseline = False
+            new_count += 1
+    return new_count, baseline_count
